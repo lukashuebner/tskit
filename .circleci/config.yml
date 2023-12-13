@@ -1,4 +1,6 @@
 version: 2.1
+orbs:
+  codecov: codecov/codecov@3.2.4
 
 commands:
   setup:
@@ -9,10 +11,12 @@ commands:
             sudo apt-get update
             sudo apt-get install -y ninja-build libcunit1-dev valgrind clang doxygen python3-pip
             # Install meson to the system packages so we can run it as root
+            pip install --upgrade pip wheel
             sudo pip install meson
-            pip install numpy==1.18.5
-            pip install --user -r python/requirements/CI-complete/requirements.txt
-            ARGO_NET_GIT_FETCH_WITH_CLI=1 pip install twine --user
+            # Needed for some build steps in requirements.txt, no blas as expensive to
+            # build on 32 bit
+            pip install --user numpy --config-settings=setup-args="-Dallow-noblas=true"
+            pip install --user -r python/requirements/CI-complete/requirements.txt --config-settings=setup-args="-Dallow-noblas=true"
             # Remove tskit installed by msprime
             pip uninstall tskit -y
             echo 'export PATH=/home/circleci/.local/bin:$PATH' >> $BASH_ENV
@@ -48,12 +52,14 @@ commands:
             ninja -C build-gcc test
 
       - run:
-          name: Run gcov & upload coverage.
+          name: Run gcov
           command: |
             cd build-gcc
             find ../c/tskit/*.c -type f -printf "%f\n" | xargs -i gcov -pb libtskit.a.p/tskit_{}.gcno ../c/tskit/{}
-            cd ..
-            bash <(curl -s https://codecov.io/bash) -X gcov -X coveragepy -F c-tests
+
+      - codecov/upload:
+          flags: c-tests
+          token: CODECOV_TOKEN
 
       - run:
           name: Valgrind for C tests.
@@ -116,14 +122,17 @@ commands:
             python -m pytest -n2
 
       - run:
-          name: Upload LWT coverage
+          name: Generate coverage
           command: |
             # Make sure the C coverage reports aren't lying around
             rm -fR build-gcc
             ls -R
             cd python/lwt_interface
             gcov -pb -o ./build/temp.linux*/*.gcno example_c_module.c
-            bash <(curl -s https://codecov.io/bash) -X gcov -F lwt-tests
+
+      - codecov/upload:
+          flags: lwt-tests
+          token: CODECOV_TOKEN
 
       - run:
           name: Run Python tests
@@ -132,14 +141,43 @@ commands:
             python -m pytest --cov=tskit  --cov-report=xml --cov-branch -n2 tests/test_lowlevel.py tests/test_tables.py tests/test_file_format.py
 
       - run:
-          name: Upload Python coverage
+          name: Generate Python coverage
           command: |
             # Make sure the C coverage reports aren't lying around
             rm -fR build-gcc
+            rm -f python/lwt_interface/*.gcov
             cd python
             gcov -pb -o ./build/temp.linux*/*.gcno _tskitmodule.c
-            bash <(curl -s https://codecov.io/bash) -X gcov -F python-c-tests
 
+      - codecov/upload:
+          flags: python-c-tests
+          token: CODECOV_TOKEN
+
+jobs:
+  build:
+    docker:
+      - image: cimg/python:3.10
+    working_directory: /home/circleci/tskit
+    steps:
+      - checkout
+      - run: sudo chown -R circleci:circleci *
+      - restore_cache:
+          # It's sometimes necessary to nuke the cache, and the simplest
+          # way to do it is to change the key. We can increment this
+          # version number when we want to do this.
+          key: tskit-{{ .Branch }}-v8
+      - setup
+      - save_cache:
+          key: tskit-{{ .Branch }}-v8
+          paths:
+            - "/home/circleci/.local"
+      - compile_and_test
+      - run:
+          name: Install dependencies for wheel test
+          command: |
+            ARGO_NET_GIT_FETCH_WITH_CLI=1 pip install twine --user
+            # Remove tskit installed by msprime
+            pip uninstall tskit -y
       - run:
           name: Build Python package
           command: |
@@ -157,40 +195,23 @@ commands:
             pip install dist/*.tar.gz
             tskit --help
 
-jobs:
-  build:
-    docker:
-      - image: cimg/python:3.7
-    working_directory: /home/circleci/tskit
-    steps:
-      - checkout
-      - run: sudo chown -R circleci:circleci *
-      - restore_cache:
-          # It's sometimes necessary to nuke the cache, and the simplest
-          # way to do it is to change the key. We can increment this
-          # version number when we want to do this.
-          key: tskit-{{ .Branch }}-v6
-      - setup
-      - save_cache:
-          key: tskit-{{ .Branch }}-v6
-          paths:
-            - "/home/circleci/.local"
-      - compile_and_test
-
   build-32:
     docker:
-      - image: tskitimages/testing-32bit:2.0
+      - image: tskitimages/testing-32bit:4.0
     working_directory: /home/circleci/tskit
     steps:
       - checkout
       - run: sudo chown -R circleci:circleci *
       - restore_cache:
-          key: tskit-32-{{ .Branch }}-v7
+          key: tskit-32-{{ .Branch }}-v8
       - setup
       - save_cache:
-          key: tskit-32-{{ .Branch }}-v7
+          key: tskit-32-{{ .Branch }}-v8
           paths:
             - "/home/circleci/.local"
+      # We need to install curl for the codecov upload.
+      - run: |
+          sudo apt-get install -y curl wget
       - compile_and_test
 
 workflows:

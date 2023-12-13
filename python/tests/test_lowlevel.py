@@ -1496,6 +1496,22 @@ class TestTreeSequence(LowLevelTestCase, MetadataTestMixin):
             ts.load_tables(tables)
             assert ts.get_time_units() == value
 
+    def test_extend_edges_bad_args(self):
+        ts1 = self.get_example_tree_sequence(10)
+        with pytest.raises(TypeError):
+            ts1.extend_edges()
+        with pytest.raises(TypeError, match="an integer"):
+            ts1.extend_edges("sdf")
+        with pytest.raises(_tskit.LibraryError, match="positive"):
+            ts1.extend_edges(0)
+        with pytest.raises(_tskit.LibraryError, match="positive"):
+            ts1.extend_edges(-1)
+        tsm = self.get_example_migration_tree_sequence()
+        with pytest.raises(
+            _tskit.LibraryError, match="TSK_ERR_MIGRATIONS_NOT_SUPPORTED"
+        ):
+            tsm.extend_edges(1)
+
     def test_kc_distance_errors(self):
         ts1 = self.get_example_tree_sequence(10)
         with pytest.raises(TypeError):
@@ -1528,6 +1544,31 @@ class TestTreeSequence(LowLevelTestCase, MetadataTestMixin):
             x1 = ts1.get_kc_distance(ts2, lambda_)
             x2 = ts2.get_kc_distance(ts1, lambda_)
             assert x1 == x2
+
+    def test_divergence_matrix(self):
+        n = 10
+        ts = self.get_example_tree_sequence(n, random_seed=12)
+        windows = [0, ts.get_sequence_length()]
+        D = ts.divergence_matrix(windows)
+        assert D.shape == (1, n, n)
+        D = ts.divergence_matrix(windows, samples=[0, 1])
+        assert D.shape == (1, 2, 2)
+        D = ts.divergence_matrix(windows, samples=[0, 1], span_normalise=True)
+        assert D.shape == (1, 2, 2)
+        with pytest.raises(TypeError, match="str"):
+            ts.divergence_matrix(windows, span_normalise="xdf")
+        with pytest.raises(TypeError):
+            ts.divergence_matrix(windoze=[0, 1])
+        with pytest.raises(ValueError, match="at least 2"):
+            ts.divergence_matrix(windows=[0])
+        with pytest.raises(_tskit.LibraryError, match="BAD_WINDOWS"):
+            ts.divergence_matrix(windows=[-1, 0, 1])
+        with pytest.raises(ValueError):
+            ts.divergence_matrix(windows=[0, 1], samples="sdf")
+        with pytest.raises(ValueError, match="Unrecognised stats mode"):
+            ts.divergence_matrix(windows=[0, 1], mode="sdf")
+        with pytest.raises(_tskit.LibraryError, match="UNSUPPORTED_STAT_MODE"):
+            ts.divergence_matrix(windows=[0, 1], mode="node")
 
     def test_load_tables_build_indexes(self):
         for ts in self.get_example_tree_sequences():
@@ -1733,6 +1774,15 @@ class StatsInterfaceMixin:
         for bad_window in bad_windows:
             with pytest.raises(_tskit.LibraryError):
                 f(windows=bad_window, **params)
+
+    def test_polarisation(self):
+        ts, f, params = self.get_example()
+        with pytest.raises(TypeError):
+            f(polarised="sdf", **params)
+        x1 = f(polarised=False, **params)
+        x2 = f(polarised=True, **params)
+        # Basic check just to run both code paths
+        assert x1.shape == x2.shape
 
     def test_windows_output(self):
         ts, f, params = self.get_example()
@@ -2096,6 +2146,78 @@ class TwoWaySampleStatsMixin(SampleSetMixin):
                 f(bad_dim)
 
 
+class TwoWayWeightedStatsMixin(StatsInterfaceMixin):
+    """
+    Tests for the weighted two way sample stats.
+    """
+
+    def get_example(self):
+        ts, method = self.get_method()
+        params = {
+            "weights": np.zeros((ts.get_num_samples(), 2)) + 0.5,
+            "indexes": [[0, 1]],
+            "windows": [0, ts.get_sequence_length()],
+        }
+        return ts, method, params
+
+    def test_basic_example(self):
+        ts, method = self.get_method()
+        div = method(
+            np.zeros((ts.get_num_samples(), 1)) + 0.5,
+            [[0, 1]],
+            windows=[0, ts.get_sequence_length()],
+        )
+        assert div.shape == (1, 1)
+
+    def test_bad_weights(self):
+        ts, f, params = self.get_example()
+        del params["weights"]
+        n = ts.get_num_samples()
+
+        for bad_weight_type in [None, [None, None]]:
+            with pytest.raises(ValueError, match="object of too small depth"):
+                f(weights=bad_weight_type, **params)
+
+        for bad_weight_shape in [(n - 1, 1), (n + 1, 1), (0, 3)]:
+            with pytest.raises(ValueError, match="First dimension must be num_samples"):
+                f(weights=np.ones(bad_weight_shape), **params)
+
+    def test_output_dims(self):
+        ts, method, params = self.get_example()
+        weights = params.pop("weights")
+        params["windows"] = [0, ts.get_sequence_length()]
+
+        for mode in ["site", "branch"]:
+            out = method(weights[:, [0]], mode=mode, **params)
+            assert out.shape == (1, 1)
+            out = method(weights, mode=mode, **params)
+            assert out.shape == (1, 1)
+            out = method(weights[:, [0, 0, 0]], mode=mode, **params)
+            assert out.shape == (1, 1)
+        mode = "node"
+        N = ts.get_num_nodes()
+        out = method(weights[:, [0]], mode=mode, **params)
+        assert out.shape == (1, N, 1)
+        out = method(weights, mode=mode, **params)
+        assert out.shape == (1, N, 1)
+        out = method(weights[:, [0, 0, 0]], mode=mode, **params)
+        assert out.shape == (1, N, 1)
+
+    def test_set_index_errors(self):
+        ts, method, params = self.get_example()
+        del params["indexes"]
+
+        def f(indexes):
+            method(indexes=indexes, **params)
+
+        for bad_array in ["wer", {}, [[[], []], [[], []]]]:
+            with pytest.raises(ValueError):
+                f(bad_array)
+        for bad_dim in [[[]], [[1], [1]]]:
+            with pytest.raises(ValueError):
+                f(bad_dim)
+
+
 class ThreeWaySampleStatsMixin(SampleSetMixin):
     """
     Tests for the two way sample stats.
@@ -2282,6 +2404,12 @@ class Testf2(LowLevelTestCase, TwoWaySampleStatsMixin):
         return ts, ts.f2
 
 
+class TestGeneticRelatedness(LowLevelTestCase, TwoWaySampleStatsMixin):
+    def get_method(self):
+        ts = self.get_example_tree_sequence()
+        return ts, ts.genetic_relatedness
+
+
 class TestY3(LowLevelTestCase, ThreeWaySampleStatsMixin):
     def get_method(self):
         ts = self.get_example_tree_sequence()
@@ -2298,6 +2426,12 @@ class Testf4(LowLevelTestCase, FourWaySampleStatsMixin):
     def get_method(self):
         ts = self.get_example_tree_sequence()
         return ts, ts.f4
+
+
+class TestWeightedGeneticRelatedness(LowLevelTestCase, TwoWayWeightedStatsMixin):
+    def get_method(self):
+        ts = self.get_example_tree_sequence()
+        return ts, ts.genetic_relatedness_weighted
 
 
 class TestGeneralStatsInterface(LowLevelTestCase, StatsInterfaceMixin):
@@ -2721,34 +2855,59 @@ class TestLsHmm(LowLevelTestCase):
         m = ts.get_num_sites()
         fm = _tskit.CompressedMatrix(ts)
         vm = _tskit.ViterbiMatrix(ts)
+        norm = np.ones(m)
         ls_hmm = _tskit.LsHmm(ts, np.zeros(m), np.zeros(m))
         for bad_size in [0, m - 1, m + 1, m + 2]:
             bad_array = np.zeros(bad_size, dtype=np.int8)
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError, match="haplotype array"):
                 ls_hmm.forward_matrix(bad_array, fm)
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError, match="haplotype array"):
+                ls_hmm.backward_matrix(bad_array, norm, fm)
+            with pytest.raises(ValueError, match="haplotype array"):
                 ls_hmm.viterbi_matrix(bad_array, vm)
         for bad_array in [[0.002], [[], []], None]:
             with pytest.raises(ValueError):
                 ls_hmm.forward_matrix(bad_array, fm)
             with pytest.raises(ValueError):
                 ls_hmm.viterbi_matrix(bad_array, vm)
+            with pytest.raises(ValueError):
+                ls_hmm.backward_matrix(bad_array, norm, fm)
+
+    def test_norm_input(self):
+        ts = self.get_example_tree_sequence()
+        m = ts.get_num_sites()
+        cm = _tskit.CompressedMatrix(ts)
+        h = np.zeros(m, dtype=np.int32)
+        ls_hmm = _tskit.LsHmm(ts, np.zeros(m), np.zeros(m))
+        for bad_size in [0, m - 1, m + 1, m + 2]:
+            bad_array = np.zeros(bad_size)
+            with pytest.raises(ValueError, match="forward_norm array"):
+                ls_hmm.backward_matrix(h, bad_array, cm)
+
+        for bad_array in [[0.002], [[], []], None]:
+            with pytest.raises(ValueError):
+                ls_hmm.backward_matrix(h, bad_array, cm)
 
     def test_output_type_errors(self):
         ts = self.get_example_tree_sequence()
         m = ts.get_num_sites()
         h = np.zeros(m, dtype=np.int8)
+        norm = np.ones(m)
         ls_hmm = _tskit.LsHmm(ts, np.zeros(m), np.zeros(m))
         for bad_type in [ls_hmm, None, m, []]:
             with pytest.raises(TypeError):
                 ls_hmm.forward_matrix(h, bad_type)
             with pytest.raises(TypeError):
                 ls_hmm.viterbi_matrix(h, bad_type)
+            with pytest.raises(TypeError):
+                ls_hmm.backward_matrix(h, norm, bad_type)
 
         other_ts = self.get_example_tree_sequence()
         output = _tskit.CompressedMatrix(other_ts)
         with pytest.raises(_tskit.LibraryError):
             ls_hmm.forward_matrix(h, output)
+        with pytest.raises(_tskit.LibraryError):
+            ls_hmm.backward_matrix(h, norm, output)
         output = _tskit.ViterbiMatrix(other_ts)
         with pytest.raises(_tskit.LibraryError):
             ls_hmm.viterbi_matrix(h, output)
@@ -2797,7 +2956,7 @@ class TestLsHmm(LowLevelTestCase):
                 assert len(item) == 2
                 node, value = item
                 assert 0 <= node < ts.get_num_nodes()
-                assert 0 <= value <= 1
+                assert value >= 0
         for site in [m, m + 1, 2 * m]:
             with pytest.raises(ValueError):
                 output.get_site(site)
@@ -2810,6 +2969,17 @@ class TestLsHmm(LowLevelTestCase):
         rv = ls_hmm.forward_matrix([0 for _ in range(m)], output)
         assert rv is None
         self.verify_compressed_matrix(ts, output)
+
+    def test_backward_matrix(self):
+        ts = self.get_example_tree_sequence()
+        m = ts.get_num_sites()
+        fm = _tskit.CompressedMatrix(ts)
+        bm = _tskit.CompressedMatrix(ts)
+        h = np.zeros(m, dtype=np.int32)
+        ls_hmm = _tskit.LsHmm(ts, np.zeros(m) + 0.1, np.zeros(m) + 0.1)
+        ls_hmm.forward_matrix(h, fm)
+        ls_hmm.backward_matrix(h, fm.normalisation_factor, bm)
+        self.verify_compressed_matrix(ts, bm)
 
     def test_viterbi_matrix(self):
         ts = self.get_example_tree_sequence()
@@ -2967,6 +3137,16 @@ class TestTree(LowLevelTestCase):
         for bad_pos in [-1, 1e6]:
             with pytest.raises(_tskit.LibraryError):
                 tree.seek(bad_pos)
+
+    def test_seek_index_errors(self):
+        ts = self.get_example_tree_sequence()
+        tree = _tskit.Tree(ts)
+        for bad_type in ["", "x", {}]:
+            with pytest.raises(TypeError):
+                tree.seek_index(bad_type)
+        for bad_index in [-1, 10**6]:
+            with pytest.raises(_tskit.LibraryError):
+                tree.seek_index(bad_index)
 
     def test_root_threshold(self):
         for ts in self.get_example_tree_sequences():
@@ -3863,7 +4043,7 @@ class TestModuleFunctions:
 
     def test_tskit_version(self):
         version = _tskit.get_tskit_version()
-        assert version == (1, 1, 1)
+        assert version == (1, 1, 2)
 
     def test_tskit_version_file(self):
         maj, min_, patch = _tskit.get_tskit_version()
@@ -3880,7 +4060,7 @@ def test_uninitialised():
     ]
     for cls_name, cls in inspect.getmembers(_tskit):
         if (
-            type(cls) == type
+            isinstance(cls, type)
             and not issubclass(cls, Exception)
             and not issubclass(cls, tuple)
         ):

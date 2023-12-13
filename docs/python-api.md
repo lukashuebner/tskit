@@ -268,6 +268,7 @@ which perform the same actions but modify the {class}`TableCollection` in place.
   TreeSequence.trim
   TreeSequence.split_edges
   TreeSequence.decapitate
+  TreeSequence.extend_edges
 ```
 
 (sec_python_api_tree_sequences_ibd)=
@@ -321,6 +322,7 @@ Single site
       TreeSequence.Fst
       TreeSequence.genealogical_nearest_neighbours
       TreeSequence.genetic_relatedness
+      TreeSequence.genetic_relatedness_weighted
       TreeSequence.general_stat
       TreeSequence.segregating_sites
       TreeSequence.sample_count_stat

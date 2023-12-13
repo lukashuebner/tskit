@@ -47,6 +47,13 @@ class Dataclass:
         """
         return dataclasses.replace(self, **kwargs)
 
+    def asdict(self, **kwargs):
+        """
+        Return a new dict which maps field names to their corresponding values
+        in this dataclass.
+        """
+        return dataclasses.asdict(self, **kwargs)
+
 
 def canonical_json(obj):
     """
@@ -329,7 +336,7 @@ def obj_to_collapsed_html(d, name=None, open_depth=0):
     opened = "open" if open_depth > 0 else ""
     open_depth -= 1
     name = str(name) + ":" if name is not None else ""
-    if type(d) == dict:
+    if type(d) is dict:
         return f"""
                 <div>
                   <span class="tskit-details-label">{name}</span>
@@ -340,7 +347,7 @@ def obj_to_collapsed_html(d, name=None, open_depth=0):
                   </details>
                 </div>
                 """
-    elif type(d) == list:
+    elif type(d) is list:
         return f"""
                 <div>
                   <span class="tskit-details-label">{name}</span>

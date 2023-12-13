@@ -140,6 +140,14 @@ class CommonTestsMixin:
             table_5row.add_row(**row)
         return table_5row
 
+    def test_asdict(self, table, test_rows):
+        for table_row, test_row in zip(table, test_rows):
+            for k, v in table_row.asdict().items():
+                if isinstance(v, np.ndarray):
+                    assert np.array_equal(v, test_row[k])
+                else:
+                    assert v == test_row[k]
+
     def test_max_rows_increment(self):
         for bad_value in [-1, -(2**10)]:
             with pytest.raises(ValueError):
@@ -805,7 +813,11 @@ class CommonTestsMixin:
 
             for _list_col, offset_col in self.ragged_list_columns:
                 original_offset = np.copy(input_data[offset_col.name])
-                input_data[offset_col.name][0] = -1
+                # As numpy no longer allows conversion of out-of-bounds values, we
+                # explictly cast first.
+                input_data[offset_col.name][0] = np.array(-1).astype(
+                    input_data[offset_col.name].dtype
+                )
                 with pytest.raises(ValueError):
                     t.set_columns(**input_data)
                 input_data[offset_col.name] = np.copy(original_offset)
@@ -820,7 +832,9 @@ class CommonTestsMixin:
                     t.set_columns(**input_data)
                 input_data[offset_col.name] = np.copy(original_offset)
 
-                input_data[offset_col.name][0] = -1
+                input_data[offset_col.name][0] = np.array(-1).astype(
+                    input_data[offset_col.name].dtype
+                )
                 with pytest.raises(ValueError):
                     t.append_columns(**input_data)
                 input_data[offset_col.name] = np.copy(original_offset)
@@ -1595,13 +1609,13 @@ class FancyIndexingMixin:
             table[[5.5]]
         with pytest.raises(TypeError, match="Cannot convert"):
             table[[None]]
-        with pytest.raises(TypeError, match="not supported between instances"):
+        with pytest.raises(TypeError, match="not supported|did not contain"):
             table[["foobar"]]
         with pytest.raises(TypeError, match="Index must be integer, slice or iterable"):
             table[5.5]
         with pytest.raises(TypeError, match="Cannot convert to a rectangular array"):
             table[None]
-        with pytest.raises(TypeError, match="not supported between instances"):
+        with pytest.raises(TypeError, match="not supported|did not contain"):
             table["foobar"]
 
 
@@ -1758,7 +1772,6 @@ class TestIndividualTable(*common_tests):
 
 
 class TestNodeTable(*common_tests):
-
     columns = [
         UInt32Column("flags"),
         DoubleColumn("time"),
@@ -1839,7 +1852,6 @@ class TestNodeTable(*common_tests):
 
 
 class TestEdgeTable(*common_tests):
-
     columns = [
         DoubleColumn("left"),
         DoubleColumn("right"),
@@ -3842,13 +3854,13 @@ class TestTableCollection:
             assert set(d1.keys()) == set(d2.keys())
             for k1, v1 in d1.items():
                 v2 = d2[k1]
-                assert type(v1) == type(v2)
-                if type(v1) == dict:
+                assert type(v1) is type(v2)
+                if type(v1) is dict:
                     assert set(v1.keys()) == set(v2.keys())
                     for sk1, sv1 in v1.items():
                         sv2 = v2[sk1]
-                        assert type(sv1) == type(sv2)
-                        if type(sv1) == np.ndarray:
+                        assert type(sv1) is type(sv2)
+                        if isinstance(sv1, np.ndarray):
                             assert np.array_equal(sv1, sv2) or (
                                 np.all(tskit.is_unknown_time(sv1))
                                 and np.all(tskit.is_unknown_time(sv2))
@@ -4158,7 +4170,6 @@ class TestTableCollectionMethodSignatures:
 
 
 class TestTableCollectionMetadata:
-
     metadata_schema = metadata.MetadataSchema(
         {
             "codec": "json",

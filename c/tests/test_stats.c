@@ -1,7 +1,7 @@
 /*
  * MIT License
  *
- * Copyright (c) 2019-2022 Tskit Developers
+ * Copyright (c) 2019-2023 Tskit Developers
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -262,6 +262,47 @@ verify_mean_descendants(tsk_treeseq_t *ts)
     free(C);
 }
 
+/* Check the divergence matrix by running against the stats API equivalent
+ * code.
+ */
+static void
+verify_divergence_matrix(tsk_treeseq_t *ts, tsk_flags_t options)
+{
+    int ret;
+    const tsk_size_t n = tsk_treeseq_get_num_samples(ts);
+    const tsk_id_t *samples = tsk_treeseq_get_samples(ts);
+    tsk_size_t sample_set_sizes[n];
+    tsk_id_t index_tuples[2 * n * n];
+    double D1[n * n], D2[n * n];
+    tsk_size_t i, j, k;
+
+    for (j = 0; j < n; j++) {
+        sample_set_sizes[j] = 1;
+        for (k = 0; k < n; k++) {
+            index_tuples[2 * (j * n + k)] = (tsk_id_t) j;
+            index_tuples[2 * (j * n + k) + 1] = (tsk_id_t) k;
+        }
+    }
+    ret = tsk_treeseq_divergence(
+        ts, n, sample_set_sizes, samples, n * n, index_tuples, 0, NULL, options, D1);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+
+    ret = tsk_treeseq_divergence_matrix(ts, 0, NULL, 0, NULL, options, D2);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+
+    for (j = 0; j < n; j++) {
+        for (k = 0; k < n; k++) {
+            i = j * n + k;
+            /* printf("%d\t%d\t%f\t%f\n", (int) j, (int) k, D1[i], D2[i]); */
+            if (j == k) {
+                CU_ASSERT_EQUAL(D2[i], 0);
+            } else {
+                CU_ASSERT_DOUBLE_EQUAL(D1[i], D2[i], 1E-6);
+            }
+        }
+    }
+}
+
 typedef struct {
     int call_count;
     int error_on;
@@ -301,6 +342,16 @@ verify_window_errors(tsk_treeseq_t *ts, tsk_flags_t mode)
 
     ret = tsk_treeseq_general_stat(
         ts, 1, W, 1, general_stat_error, NULL, 2, windows, options, sigma);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
+
+    windows[0] = -1;
+    ret = tsk_treeseq_general_stat(
+        ts, 1, W, 1, general_stat_error, NULL, 2, windows, options, sigma);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
+
+    windows[1] = -1;
+    ret = tsk_treeseq_general_stat(
+        ts, 1, W, 1, general_stat_error, NULL, 1, windows, options, sigma);
     CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
 
     windows[0] = 10;
@@ -396,11 +447,10 @@ verify_node_general_stat_errors(tsk_treeseq_t *ts)
 static void
 verify_one_way_weighted_func_errors(tsk_treeseq_t *ts, one_way_weighted_method *method)
 {
-    // we don't have any specific errors for this function
-    // but we might add some in the future
     int ret;
     tsk_size_t num_samples = tsk_treeseq_get_num_samples(ts);
     double *weights = tsk_malloc(num_samples * sizeof(double));
+    double bad_windows[] = { 0, -1 };
     double result;
     tsk_size_t j;
 
@@ -409,7 +459,10 @@ verify_one_way_weighted_func_errors(tsk_treeseq_t *ts, one_way_weighted_method *
     }
 
     ret = method(ts, 0, weights, 0, NULL, 0, &result);
-    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_STATE_DIMS);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_INSUFFICIENT_WEIGHTS);
+
+    ret = method(ts, 1, weights, 1, bad_windows, 0, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
 
     free(weights);
 }
@@ -418,12 +471,11 @@ static void
 verify_one_way_weighted_covariate_func_errors(
     tsk_treeseq_t *ts, one_way_covariates_method *method)
 {
-    // we don't have any specific errors for this function
-    // but we might add some in the future
     int ret;
     tsk_size_t num_samples = tsk_treeseq_get_num_samples(ts);
     double *weights = tsk_malloc(num_samples * sizeof(double));
     double *covariates = NULL;
+    double bad_windows[] = { 0, -1 };
     double result;
     tsk_size_t j;
 
@@ -432,7 +484,10 @@ verify_one_way_weighted_covariate_func_errors(
     }
 
     ret = method(ts, 0, weights, 0, covariates, 0, NULL, 0, &result);
-    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_STATE_DIMS);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_INSUFFICIENT_WEIGHTS);
+
+    ret = method(ts, 1, weights, 0, covariates, 1, bad_windows, 0, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
 
     free(weights);
 }
@@ -514,6 +569,28 @@ verify_two_way_stat_func_errors(tsk_treeseq_t *ts, general_sample_stat_method *m
     ret = method(ts, 2, sample_set_sizes, samples, 1, set_indexes, 0, NULL,
         TSK_STAT_SITE, &result);
     CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_SAMPLE_SET_INDEX);
+}
+
+static void
+verify_two_way_weighted_stat_func_errors(
+    tsk_treeseq_t *ts, two_way_weighted_method *method)
+{
+    int ret;
+    tsk_id_t indexes[] = { 0, 0, 0, 1 };
+    double bad_windows[] = { -1, -1 };
+    double weights[10];
+    double result[10];
+
+    memset(weights, 0, sizeof(weights));
+
+    ret = method(ts, 2, weights, 2, indexes, 0, NULL, result, 0);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+
+    ret = method(ts, 0, weights, 2, indexes, 0, NULL, result, 0);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_INSUFFICIENT_WEIGHTS);
+
+    ret = method(ts, 2, weights, 2, indexes, 1, bad_windows, result, 0);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
 }
 
 static void
@@ -974,6 +1051,132 @@ test_single_tree_general_stat_errors(void)
 }
 
 static void
+test_single_tree_divergence_matrix(void)
+{
+    tsk_treeseq_t ts;
+    int ret;
+    double result[16];
+    double D_branch[16] = { 0, 2, 6, 6, 2, 0, 6, 6, 6, 6, 0, 4, 6, 6, 4, 0 };
+    double D_site[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    tsk_treeseq_from_text(&ts, 1, single_tree_ex_nodes, single_tree_ex_edges, NULL, NULL,
+        NULL, NULL, NULL, 0);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(16, result, D_branch);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_SITE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(16, result, D_site);
+
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH);
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH | TSK_STAT_SPAN_NORMALISE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE | TSK_STAT_SPAN_NORMALISE);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_single_tree_divergence_matrix_internal_samples(void)
+{
+    tsk_treeseq_t ts;
+    int ret;
+    double result[16];
+    double D[16] = { 0, 2, 4, 3, 2, 0, 4, 3, 4, 4, 0, 1, 3, 3, 1, 0 };
+
+    const char *nodes = "1  0   -1   -1\n" /* 2.00┊    6    ┊ */
+                        "1  0   -1   -1\n" /*     ┊  ┏━┻━┓  ┊ */
+                        "1  0   -1   -1\n" /* 1.00┊  4   5* ┊ */
+                        "0  0   -1   -1\n" /*     ┊ ┏┻┓ ┏┻┓ ┊ */
+                        "0  1   -1   -1\n" /* 0.00┊ 0 1 2 3 ┊ */
+                        "1  1   -1   -1\n" /*     0 * * *   1 */
+                        "0  2   -1   -1\n";
+    const char *edges = "0  1   4   0,1\n"
+                        "0  1   5   2,3\n"
+                        "0  1   6   4,5\n";
+    /* One mutations per branch so we get the same as the branch length value */
+    const char *sites = "0.1  A\n"
+                        "0.2  A\n"
+                        "0.3  A\n"
+                        "0.4  A\n"
+                        "0.5  A\n"
+                        "0.6  A\n";
+    const char *mutations = "0  0  T  -1\n"
+                            "1  1  T  -1\n"
+                            "2  2  T  -1\n"
+                            "3  3  T  -1\n"
+                            "4  4  T  -1\n"
+                            "5  5  T  -1\n";
+
+    tsk_treeseq_from_text(&ts, 1, nodes, edges, NULL, sites, mutations, NULL, NULL, 0);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(16, result, D);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_SITE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(16, result, D);
+
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH);
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH | TSK_STAT_SPAN_NORMALISE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE | TSK_STAT_SPAN_NORMALISE);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_single_tree_divergence_matrix_multi_root(void)
+{
+    tsk_treeseq_t ts;
+    int ret;
+    double result[16];
+    double D_branch[16] = { 0, 2, 3, 3, 2, 0, 3, 3, 3, 3, 0, 4, 3, 3, 4, 0 };
+
+    const char *nodes = "1  0   -1   -1\n"
+                        "1  0   -1   -1\n"  /* 2.00┊      5  ┊ */
+                        "1  0   -1   -1\n"  /* 1.00┊  4      ┊ */
+                        "1  0   -1   -1\n"  /*     ┊ ┏┻┓ ┏┻┓ ┊ */
+                        "0  1   -1   -1\n"  /* 0.00┊ 0 1 2 3 ┊ */
+                        "0  2   -1   -1\n"; /*     0 * * * * 1 */
+    const char *edges = "0  1   4   0,1\n"
+                        "0  1   5   2,3\n";
+    /* Two mutations per branch */
+    const char *sites = "0.1  A\n"
+                        "0.2  A\n"
+                        "0.3  A\n"
+                        "0.4  A\n";
+    const char *mutations = "0  0  B  -1\n"
+                            "0  0  C  0\n"
+                            "1  1  B  -1\n"
+                            "1  1  C  2\n"
+                            "2  2  B  -1\n"
+                            "2  2  C  4\n"
+                            "2  2  D  5\n"
+                            "2  2  E  6\n"
+                            "3  3  B  -1\n"
+                            "3  3  C  8\n"
+                            "3  3  D  9\n"
+                            "3  3  E  10\n";
+
+    tsk_treeseq_from_text(&ts, 1, nodes, edges, NULL, sites, mutations, NULL, NULL, 0);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(16, result, D_branch);
+
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH);
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH | TSK_STAT_SPAN_NORMALISE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE | TSK_STAT_SPAN_NORMALISE);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
 test_paper_ex_ld(void)
 {
     tsk_treeseq_t ts;
@@ -1352,6 +1555,46 @@ test_paper_ex_genetic_relatedness_errors(void)
 }
 
 static void
+test_paper_ex_genetic_relatedness_weighted(void)
+{
+    tsk_treeseq_t ts;
+    double weights[] = { 1.2, 0.1, 0.0, 0.0, 3.4, 5.0, 1.0, -1.0 };
+    tsk_id_t indexes[] = { 0, 0, 0, 1 };
+    double result[100];
+    tsk_size_t num_weights;
+    int ret;
+
+    tsk_treeseq_from_text(&ts, 10, paper_ex_nodes, paper_ex_edges, NULL, paper_ex_sites,
+        paper_ex_mutations, paper_ex_individuals, NULL, 0);
+
+    for (num_weights = 1; num_weights < 3; num_weights++) {
+        ret = tsk_treeseq_genetic_relatedness_weighted(
+            &ts, num_weights, weights, 2, indexes, 0, NULL, result, TSK_STAT_SITE);
+        CU_ASSERT_EQUAL_FATAL(ret, 0);
+        ret = tsk_treeseq_genetic_relatedness_weighted(
+            &ts, num_weights, weights, 2, indexes, 0, NULL, result, TSK_STAT_BRANCH);
+        CU_ASSERT_EQUAL_FATAL(ret, 0);
+        ret = tsk_treeseq_genetic_relatedness_weighted(
+            &ts, num_weights, weights, 2, indexes, 0, NULL, result, TSK_STAT_NODE);
+        CU_ASSERT_EQUAL_FATAL(ret, 0);
+    }
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_paper_ex_genetic_relatedness_weighted_errors(void)
+{
+    tsk_treeseq_t ts;
+
+    tsk_treeseq_from_text(&ts, 10, paper_ex_nodes, paper_ex_edges, NULL, paper_ex_sites,
+        paper_ex_mutations, paper_ex_individuals, NULL, 0);
+    verify_two_way_weighted_stat_func_errors(
+        &ts, tsk_treeseq_genetic_relatedness_weighted);
+    tsk_treeseq_free(&ts);
+}
+
+static void
 test_paper_ex_Y2_errors(void)
 {
     tsk_treeseq_t ts;
@@ -1593,6 +1836,22 @@ test_paper_ex_afs(void)
 }
 
 static void
+test_paper_ex_divergence_matrix(void)
+{
+    tsk_treeseq_t ts;
+
+    tsk_treeseq_from_text(&ts, 10, paper_ex_nodes, paper_ex_edges, NULL, paper_ex_sites,
+        paper_ex_mutations, paper_ex_individuals, NULL, 0);
+
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH);
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH | TSK_STAT_SPAN_NORMALISE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE | TSK_STAT_SPAN_NORMALISE);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
 test_nonbinary_ex_ld(void)
 {
     tsk_treeseq_t ts;
@@ -1726,6 +1985,619 @@ test_ld_silent_mutations(void)
     free(base_ts);
 }
 
+static void
+test_paper_ex_two_site(void)
+{
+    tsk_treeseq_t ts;
+    double *result;
+    tsk_size_t s, result_size;
+    int ret;
+
+    double truth_one_set[6] = { 1, 0.1111111111111111, 0.1111111111111111, 1, 1, 1 };
+    double truth_two_sets[12] = { 1, 1, 0.1111111111111111, 0.1111111111111111,
+        0.1111111111111111, 0.1111111111111111, 1, 1, 1, 1, 1, 1 };
+    double truth_three_sets[18] = { 1, 1, 0, 0.1111111111111111, 0.1111111111111111, 0,
+        0.1111111111111111, 0.1111111111111111, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+
+    tsk_treeseq_from_text(&ts, 10, paper_ex_nodes, paper_ex_edges, NULL, paper_ex_sites,
+        paper_ex_mutations, paper_ex_individuals, NULL, 0);
+
+    tsk_size_t sample_set_sizes[3];
+    tsk_size_t num_sample_sets;
+    tsk_id_t sample_sets[ts.num_samples * 3];
+
+    // First sample set contains all of the samples
+    sample_set_sizes[0] = ts.num_samples;
+    num_sample_sets = 1;
+    for (s = 0; s < ts.num_samples; s++) {
+        sample_sets[s] = (tsk_id_t) s;
+    }
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 6);
+    assert_arrays_almost_equal(result_size * num_sample_sets, result, truth_one_set);
+    tsk_safe_free(result);
+
+    // Second sample set contains all of the samples
+    sample_set_sizes[1] = ts.num_samples;
+    num_sample_sets = 2;
+    for (s = ts.num_samples; s < ts.num_samples * 2; s++) {
+        sample_sets[s] = (tsk_id_t) s - (tsk_id_t) ts.num_samples;
+    }
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 6);
+    assert_arrays_almost_equal(result_size * num_sample_sets, result, truth_two_sets);
+    tsk_safe_free(result);
+
+    // Third sample set contains the first two samples
+    sample_set_sizes[2] = 2;
+    num_sample_sets = 3;
+    for (s = ts.num_samples * 2; s < (ts.num_samples * 3) - 2; s++) {
+        sample_sets[s] = (tsk_id_t) s - (tsk_id_t) ts.num_samples * 2;
+    }
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 6);
+    assert_arrays_almost_equal(result_size * num_sample_sets, result, truth_three_sets);
+    tsk_safe_free(result);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_two_site_correlated_multiallelic(void)
+{
+    const char *nodes = "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "1   0   -1\n"
+                        "0   2   -1\n"
+                        "0   4   -1\n"
+                        "0   6   -1\n"
+                        "0   8   -1\n"
+                        "0   10  -1\n"
+                        "0   12  -1\n"
+                        "0   14  -1\n"
+                        "0   16  -1\n";
+    const char *edges = "0   20   9    0,1\n"
+                        "0   20   10   2,9\n"
+                        "0   20   11   4,5\n"
+                        "0   20   12   6,11\n"
+                        "0   20   13   7,8\n"
+                        "0   20   14   3,10\n"
+                        "0   10   15   12\n"
+                        "10  20   15   13\n"
+                        "0   10   15   14\n"
+                        "10  20   15   14\n"
+                        "10  20   16   12\n"
+                        "0   10   16   13\n"
+                        "0   10   16   15\n"
+                        "10  20   16   15\n";
+    const char *sites = "7   A\n"
+                        "13  G\n";
+    const char *mutations = "0   15  T  -1\n"
+                            "0   14  G   0\n"
+                            "1   15  T  -1\n"
+                            "1   13  C   2\n";
+
+    int ret;
+
+    tsk_treeseq_t ts;
+    double *result;
+    tsk_size_t s, result_size;
+
+    double truth_D[3]
+        = { 0.043209876543209874, -0.018518518518518517, 0.05555555555555555 };
+    double truth_D2[3]
+        = { 0.023844603634269844, 0.02384460363426984, 0.02384460363426984 };
+    double truth_r2[3] = { 1, 1, 1 };
+    double truth_D_prime[3]
+        = { 0.7777777777777777, 0.4444444444444444, 0.6666666666666666 };
+    double truth_r[3]
+        = { 0.18377223398316206, -0.12212786219416509, 0.2609542781331212 };
+    double truth_Dz[3]
+        = { 0.0033870175616860566, 0.003387017561686057, 0.003387017561686057 };
+    double truth_pi2[3]
+        = { 0.04579247743399549, 0.04579247743399549, 0.0457924774339955 };
+
+    tsk_treeseq_from_text(&ts, 20, nodes, edges, NULL, sites, mutations, NULL, NULL, 0);
+
+    tsk_size_t sample_set_sizes[1] = { ts.num_samples };
+    tsk_size_t num_sample_sets = 1;
+    tsk_id_t sample_sets[ts.num_samples];
+
+    for (s = 0; s < ts.num_samples; s++) {
+        sample_sets[s] = (tsk_id_t) s;
+    }
+
+    ret = tsk_treeseq_D(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_D);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_D2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_D2);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_r2);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_D_prime(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0,
+        NULL, 0, NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_D_prime);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_r(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_r);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_Dz(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_Dz);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_pi2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL,
+        0, NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_pi2);
+    tsk_safe_free(result);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_two_site_uncorrelated_multiallelic(void)
+{
+    const char *nodes = "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "1   0  -1\n"
+                        "0   2  -1\n"
+                        "0   4  -1\n"
+                        "0   6  -1\n"
+                        "0   8  -1\n"
+                        "0   10 -1\n"
+                        "0   12 -1\n"
+                        "0   14 -1\n"
+                        "0   16 -1\n"
+                        "0   2  -1\n"
+                        "0   4  -1\n"
+                        "0   6  -1\n"
+                        "0   8  -1\n"
+                        "0   10 -1\n"
+                        "0   12 -1\n"
+                        "0   14 -1\n"
+                        "0   16 -1\n";
+    const char *edges = "0     10    9      0,1\n"
+                        "10    20    17     0,3\n"
+                        "0     10    10     2,9\n"
+                        "10    20    18     6,17\n"
+                        "0     10    11     3,4\n"
+                        "10    20    19     1,4\n"
+                        "0     10    12     5,11\n"
+                        "10    20    20     7,19\n"
+                        "0     10    13     6,7\n"
+                        "10    20    21     2,5\n"
+                        "0     10    14     8,13\n"
+                        "10    20    22     8,21\n"
+                        "0     10    15     10,12\n"
+                        "10    20    23     18,20\n"
+                        "0     10    16     14,15\n"
+                        "10    20    24     22,23\n";
+    const char *sites = "7   A\n"
+                        "13  G\n";
+    const char *mutations = "0   15  T  -1\n"
+                            "0   12  G   0\n"
+                            "1   23  T  -1\n"
+                            "1   20  A   2\n";
+
+    tsk_treeseq_t ts;
+
+    int ret;
+    double *result;
+    tsk_size_t result_size;
+
+    double truth_D[3] = { 0.05555555555555555, 0.0, 0.05555555555555555 };
+    double truth_D2[3] = { 0.024691358024691357, 0.0, 0.024691358024691357 };
+    double truth_r2[3] = { 1, 0, 1 };
+    double truth_D_prime[3] = { 0.6666666666666665, 0.0, 0.6666666666666665 };
+    double truth_r[3] = { 0.24999999999999997, 0.0, 0.24999999999999997 };
+    double truth_Dz[3] = { 0.0, 0.0, 0.0 };
+    double truth_pi2[3]
+        = { 0.04938271604938272, 0.04938271604938272, 0.04938271604938272 };
+
+    tsk_treeseq_from_text(&ts, 20, nodes, edges, NULL, sites, mutations, NULL, NULL, 0);
+
+    tsk_size_t sample_set_sizes[1] = { ts.num_samples };
+    tsk_size_t num_sample_sets = 1;
+    tsk_id_t sample_sets[ts.num_samples];
+
+    for (tsk_size_t s = 0; s < ts.num_samples; s++) {
+        sample_sets[s] = (tsk_id_t) s;
+    }
+
+    ret = tsk_treeseq_D(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_D);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_D2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_D2);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_r2);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_D_prime(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0,
+        NULL, 0, NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_D_prime);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_r(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_r);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_Dz(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_Dz);
+    tsk_safe_free(result);
+
+    ret = tsk_treeseq_pi2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL,
+        0, NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    assert_arrays_almost_equal(result_size, result, truth_pi2);
+    tsk_safe_free(result);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_two_site_backmutation(void)
+{
+    const char *nodes
+        = "1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n"
+          "1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n"
+          "1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n"
+          "1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n1 0  -1\n"
+          "1 0  -1\n1 0  -1\n1 0  -1\n0 2  -1\n0 4  -1\n0 6  -1\n0 8  -1\n0 10 -1\n"
+          "0 12 -1\n0 14 -1\n0 16 -1\n0 18 -1\n0 20 -1\n0 22 -1\n0 24 -1\n0 26 -1\n"
+          "0 28 -1\n0 30 -1\n0 32 -1\n0 34 -1\n0 36 -1\n0 38 -1\n0 40 -1\n0 42 -1\n"
+          "0 44 -1\n0 46 -1\n0 48 -1\n0 50 -1\n0 52 -1\n0 54 -1\n0 56 -1\n0 58 -1\n"
+          "0 60 -1\n0 62 -1\n0 64 -1\n0 66 -1\n0 68 -1\n";
+
+    const char *edges
+        = "0 10 35 0,1\n0 10 36 2,35\n0 10 37 3,36\n0 10 38 4,37\n0 10 39 5,38\n"
+          "0 10 40 6,39\n0 10 41 7,40\n0 10 42 8,41\n0 10 43 9,42\n0 10 44 10,43\n"
+          "0 10 45 11,44\n0 10 46 12,45\n0 10 47 13,46\n0 10 48 14,47\n0 10 49 15,48\n"
+          "0 10 50 16,49\n0 10 51 17,50\n0 10 52 18,51\n0 10 53 19,52\n0 10 54 20,53\n"
+          "0 10 55 21,54\n0 10 56 22,55\n0 10 57 23,56\n0 10 58 24,57\n0 10 59 25,58\n"
+          "0 10 60 26,59\n0 10 61 27,60\n0 10 62 28,61\n0 10 63 29,62\n0 10 64 30,63\n"
+          "0 10 65 31,64\n0 10 66 32,65\n0 10 67 33,66\n0 10 68 34,67\n";
+
+    const char *sites = "1    A\n"
+                        "4.5  T\n";
+
+    const char *mutations = "0  50  T  -1\n"
+                            "0  48  G   0\n"
+                            "0  46  A   1\n"
+                            "1  62  G  -1\n"
+                            "1  60  T   3\n"
+                            "1  58  A   4\n";
+
+    int ret;
+    double *result;
+    tsk_size_t result_size;
+
+    tsk_treeseq_t ts;
+    tsk_treeseq_from_text(&ts, 10, nodes, edges, NULL, sites, mutations, NULL, NULL, 0);
+
+    tsk_size_t sample_set_sizes[1] = { ts.num_samples };
+    tsk_size_t num_sample_sets = 1;
+    tsk_id_t sample_sets[ts.num_samples];
+
+    for (tsk_size_t s = 0; s < ts.num_samples; s++) {
+        sample_sets[s] = (tsk_id_t) s;
+    }
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    CU_ASSERT_EQUAL(result_size, 3);
+    /* assert_arrays_almost_equal(result_size, result, truth_r2); */
+    tsk_safe_free(result);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_two_locus_stat_input_errors(void)
+{
+    tsk_treeseq_t ts;
+    double *result;
+    tsk_size_t s, result_size;
+    int ret;
+
+    tsk_treeseq_from_text(&ts, 1, single_tree_ex_nodes, single_tree_ex_edges, NULL,
+        single_tree_ex_sites, single_tree_ex_mutations, NULL, NULL, 0);
+
+    tsk_size_t sample_set_sizes[1];
+    tsk_size_t num_sample_sets;
+    tsk_id_t sample_sets[ts.num_samples];
+
+    sample_set_sizes[0] = ts.num_samples;
+    num_sample_sets = 1;
+    for (s = 0; s < ts.num_samples; s++) {
+        sample_sets[s] = (tsk_id_t) s;
+    }
+
+    sample_sets[1] = 0;
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_DUPLICATE_SAMPLE);
+    sample_sets[1] = 1;
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, TSK_STAT_SITE | TSK_STAT_BRANCH, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_MULTIPLE_STAT_MODES);
+
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, TSK_STAT_BRANCH, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_UNSUPPORTED_STAT_MODE);
+
+    ret = tsk_treeseq_r2(&ts, 0, sample_set_sizes, sample_sets, 0, NULL, 0, NULL, 0,
+        &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_STATE_DIMS);
+
+    sample_set_sizes[0] = 0;
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_EMPTY_SAMPLE_SET);
+    sample_set_sizes[0] = ts.num_samples;
+
+    sample_sets[1] = 10;
+    ret = tsk_treeseq_r2(&ts, num_sample_sets, sample_set_sizes, sample_sets, 0, NULL, 0,
+        NULL, 0, &result_size, &result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_NODE_OUT_OF_BOUNDS);
+    sample_sets[1] = 1;
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_simplest_divergence_matrix(void)
+{
+    const char *nodes = "1  0   0\n"
+                        "1  0   0\n"
+                        "0  1   0\n";
+    const char *edges = "0  1   2   0,1\n";
+    tsk_treeseq_t ts;
+    tsk_id_t sample_ids[] = { 0, 1 };
+    double D_branch[4] = { 0, 2, 2, 0 };
+    double D_site[4] = { 0, 0, 0, 0 };
+    double result[4];
+    int ret;
+
+    tsk_treeseq_from_text(&ts, 1, nodes, edges, NULL, NULL, NULL, NULL, NULL, 0);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_branch, result);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 0, NULL, TSK_STAT_BRANCH | TSK_STAT_SPAN_NORMALISE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_branch, result);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 0, NULL, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_site, result);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 0, NULL, TSK_STAT_SPAN_NORMALISE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_site, result);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 0, NULL, TSK_STAT_SITE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_site, result);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_branch, result);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_SITE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_site, result);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 0, NULL, 0, NULL, TSK_STAT_NODE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_UNSUPPORTED_STAT_MODE);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 0, NULL, 0, NULL, TSK_STAT_POLARISED, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_STAT_POLARISED_UNSUPPORTED);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 0, NULL, 0, NULL, TSK_STAT_SITE | TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_MULTIPLE_STAT_MODES);
+
+    sample_ids[0] = -1;
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 0, NULL, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_NODE_OUT_OF_BOUNDS);
+
+    sample_ids[0] = 3;
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 0, NULL, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_NODE_OUT_OF_BOUNDS);
+
+    sample_ids[0] = 1;
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 0, NULL, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_DUPLICATE_SAMPLE);
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_DUPLICATE_SAMPLE);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_simplest_divergence_matrix_windows(void)
+{
+    const char *nodes = "1  0   0\n"
+                        "1  0   0\n"
+                        "0  1   0\n";
+    const char *edges = "0  1   2   0,1\n";
+    const char *sites = "0.1  A\n"
+                        "0.6  A\n";
+    const char *mutations = "0  0  B  -1\n"
+                            "1  0  B  -1\n";
+    tsk_treeseq_t ts;
+    tsk_id_t sample_ids[] = { 0, 1 };
+    double D_branch[8] = { 0, 1, 1, 0, 0, 1, 1, 0 };
+    double D_site[8] = { 0, 1, 1, 0, 0, 1, 1, 0 };
+    double result[8];
+    double windows[] = { 0, 0.5, 1 };
+    int ret;
+
+    tsk_treeseq_from_text(&ts, 1, nodes, edges, NULL, sites, mutations, NULL, NULL, 0);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 2, windows, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(8, D_site, result);
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 2, windows, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(8, D_branch, result);
+
+    /* Windows for the second half */
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 1, windows + 1, TSK_STAT_SITE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_site, result);
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 2, sample_ids, 1, windows + 1, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(4, D_branch, result);
+
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 0, windows, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_NUM_WINDOWS);
+
+    windows[0] = -1;
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 2, windows, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
+
+    windows[0] = 0.45;
+    windows[2] = 1.5;
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 2, windows, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
+
+    windows[0] = 0.55;
+    windows[2] = 1.0;
+    ret = tsk_treeseq_divergence_matrix(&ts, 2, sample_ids, 2, windows, 0, result);
+    CU_ASSERT_EQUAL_FATAL(ret, TSK_ERR_BAD_WINDOWS);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_simplest_divergence_matrix_internal_sample(void)
+{
+    const char *nodes = "1  0   0\n"
+                        "1  0   0\n"
+                        "0  1   0\n";
+    const char *edges = "0  1   2   0,1\n";
+    tsk_treeseq_t ts;
+    tsk_id_t sample_ids[] = { 0, 1, 2 };
+    double result[9];
+    double D_branch[9] = { 0, 2, 1, 2, 0, 1, 1, 1, 0 };
+    double D_site[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    int ret;
+
+    tsk_treeseq_from_text(&ts, 1, nodes, edges, NULL, NULL, NULL, NULL, NULL, 0);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 3, sample_ids, 0, NULL, TSK_STAT_BRANCH, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(9, D_branch, result);
+
+    ret = tsk_treeseq_divergence_matrix(
+        &ts, 3, sample_ids, 0, NULL, TSK_STAT_SITE, result);
+    CU_ASSERT_EQUAL_FATAL(ret, 0);
+    assert_arrays_almost_equal(9, D_site, result);
+
+    tsk_treeseq_free(&ts);
+}
+
+static void
+test_multiroot_divergence_matrix(void)
+{
+    tsk_treeseq_t ts;
+
+    tsk_treeseq_from_text(&ts, 10, multiroot_ex_nodes, multiroot_ex_edges, NULL,
+        multiroot_ex_sites, multiroot_ex_mutations, NULL, NULL, 0);
+
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH);
+    verify_divergence_matrix(&ts, TSK_STAT_BRANCH | TSK_STAT_SPAN_NORMALISE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE);
+    verify_divergence_matrix(&ts, TSK_STAT_SITE | TSK_STAT_SPAN_NORMALISE);
+
+    tsk_treeseq_free(&ts);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1745,6 +2617,11 @@ main(int argc, char **argv)
             test_single_tree_genealogical_nearest_neighbours },
         { "test_single_tree_general_stat", test_single_tree_general_stat },
         { "test_single_tree_general_stat_errors", test_single_tree_general_stat_errors },
+        { "test_single_tree_divergence_matrix", test_single_tree_divergence_matrix },
+        { "test_single_tree_divergence_matrix_internal_samples",
+            test_single_tree_divergence_matrix_internal_samples },
+        { "test_single_tree_divergence_matrix_multi_root",
+            test_single_tree_divergence_matrix_multi_root },
 
         { "test_paper_ex_ld", test_paper_ex_ld },
         { "test_paper_ex_mean_descendants", test_paper_ex_mean_descendants },
@@ -1773,6 +2650,10 @@ main(int argc, char **argv)
         { "test_paper_ex_genetic_relatedness_errors",
             test_paper_ex_genetic_relatedness_errors },
         { "test_paper_ex_genetic_relatedness", test_paper_ex_genetic_relatedness },
+        { "test_paper_ex_genetic_relatedness_weighted",
+            test_paper_ex_genetic_relatedness_weighted },
+        { "test_paper_ex_genetic_relatedness_weighted_errors",
+            test_paper_ex_genetic_relatedness_weighted_errors },
         { "test_paper_ex_Y2_errors", test_paper_ex_Y2_errors },
         { "test_paper_ex_Y2", test_paper_ex_Y2 },
         { "test_paper_ex_f2_errors", test_paper_ex_f2_errors },
@@ -1785,6 +2666,7 @@ main(int argc, char **argv)
         { "test_paper_ex_f4", test_paper_ex_f4 },
         { "test_paper_ex_afs_errors", test_paper_ex_afs_errors },
         { "test_paper_ex_afs", test_paper_ex_afs },
+        { "test_paper_ex_divergence_matrix", test_paper_ex_divergence_matrix },
 
         { "test_nonbinary_ex_ld", test_nonbinary_ex_ld },
         { "test_nonbinary_ex_mean_descendants", test_nonbinary_ex_mean_descendants },
@@ -1797,6 +2679,21 @@ main(int argc, char **argv)
         { "test_caterpillar_tree_ld", test_caterpillar_tree_ld },
         { "test_ld_multi_mutations", test_ld_multi_mutations },
         { "test_ld_silent_mutations", test_ld_silent_mutations },
+
+        { "test_paper_ex_two_site", test_paper_ex_two_site },
+        { "test_two_site_correlated_multiallelic",
+            test_two_site_correlated_multiallelic },
+        { "test_two_site_uncorrelated_multiallelic",
+            test_two_site_uncorrelated_multiallelic },
+        { "test_two_site_backmutation", test_two_site_backmutation },
+        { "test_two_locus_stat_input_errors", test_two_locus_stat_input_errors },
+
+        { "test_simplest_divergence_matrix", test_simplest_divergence_matrix },
+        { "test_simplest_divergence_matrix_windows",
+            test_simplest_divergence_matrix_windows },
+        { "test_simplest_divergence_matrix_internal_sample",
+            test_simplest_divergence_matrix_internal_sample },
+        { "test_multiroot_divergence_matrix", test_multiroot_divergence_matrix },
 
         { NULL, NULL },
     };

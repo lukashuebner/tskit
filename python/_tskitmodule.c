@@ -578,7 +578,8 @@ make_alleles(tsk_variant_t *variant)
         goto out;
     }
     for (j = 0; j < variant->num_alleles; j++) {
-        item = Py_BuildValue("s#", variant->alleles[j], variant->allele_lengths[j]);
+        item = Py_BuildValue(
+            "s#", variant->alleles[j], (Py_ssize_t) variant->allele_lengths[j]);
         if (item == NULL) {
             Py_DECREF(t);
             goto out;
@@ -8937,6 +8938,46 @@ out:
     return ret;
 }
 
+static PyObject *
+TreeSequence_extend_edges(TreeSequence *self, PyObject *args, PyObject *kwds)
+{
+    int err;
+    PyObject *ret = NULL;
+    int max_iter;
+    tsk_flags_t options = 0;
+    static char *kwlist[] = { "max_iter", NULL };
+    TreeSequence *output = NULL;
+
+    if (TreeSequence_check_state(self) != 0) {
+        goto out;
+    }
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "i", kwlist, &max_iter)) {
+        goto out;
+    }
+
+    output = (TreeSequence *) _PyObject_New((PyTypeObject *) &TreeSequenceType);
+    if (output == NULL) {
+        goto out;
+    }
+    output->tree_sequence = PyMem_Malloc(sizeof(*output->tree_sequence));
+    if (output->tree_sequence == NULL) {
+        PyErr_NoMemory();
+        goto out;
+    }
+
+    err = tsk_treeseq_extend_edges(
+        self->tree_sequence, max_iter, options, output->tree_sequence);
+    if (err != 0) {
+        handle_library_error(err);
+        goto out;
+    }
+    ret = (PyObject *) output;
+    output = NULL;
+out:
+    Py_XDECREF(output);
+    return ret;
+}
+
 /* Error value returned from summary_func callback if an error occured.
  * This is chosen so that it is not a valid tskit error code and so can
  * never be mistaken for a different error */
@@ -9595,6 +9636,93 @@ out:
 }
 
 static PyObject *
+TreeSequence_k_way_weighted_stat_method(TreeSequence *self, PyObject *args,
+    PyObject *kwds, npy_intp tuple_size, two_way_weighted_method *method)
+{
+    PyObject *ret = NULL;
+    static char *kwlist[] = { "weights", "indexes", "windows", "mode", "span_normalise",
+        "polarised", NULL };
+    PyObject *weights = NULL;
+    PyObject *indexes = NULL;
+    PyObject *windows = NULL;
+    PyArrayObject *weights_array = NULL;
+    PyArrayObject *indexes_array = NULL;
+    PyArrayObject *windows_array = NULL;
+    PyArrayObject *result_array = NULL;
+    tsk_size_t num_windows, num_index_tuples;
+    npy_intp *w_shape, *shape;
+    tsk_flags_t options = 0;
+    char *mode = NULL;
+    int span_normalise = true;
+    int polarised = false;
+    int err;
+
+    if (TreeSequence_check_state(self) != 0) {
+        goto out;
+    }
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "OOO|sii", kwlist, &weights, &indexes,
+            &windows, &mode, &span_normalise, &polarised)) {
+        goto out;
+    }
+    if (parse_stats_mode(mode, &options) != 0) {
+        goto out;
+    }
+    if (span_normalise) {
+        options |= TSK_STAT_SPAN_NORMALISE;
+    }
+    if (polarised) {
+        options |= TSK_STAT_POLARISED;
+    }
+    if (parse_windows(windows, &windows_array, &num_windows) != 0) {
+        goto out;
+    }
+    weights_array = (PyArrayObject *) PyArray_FROMANY(
+        weights, NPY_FLOAT64, 2, 2, NPY_ARRAY_IN_ARRAY);
+    if (weights_array == NULL) {
+        goto out;
+    }
+    w_shape = PyArray_DIMS(weights_array);
+    if (w_shape[0] != (npy_intp) tsk_treeseq_get_num_samples(self->tree_sequence)) {
+        PyErr_SetString(PyExc_ValueError, "First dimension must be num_samples");
+        goto out;
+    }
+
+    indexes_array = (PyArrayObject *) PyArray_FROMANY(
+        indexes, NPY_INT32, 2, 2, NPY_ARRAY_IN_ARRAY);
+    if (indexes_array == NULL) {
+        goto out;
+    }
+    shape = PyArray_DIMS(indexes_array);
+    if (shape[0] < 1 || shape[1] != tuple_size) {
+        PyErr_Format(
+            PyExc_ValueError, "indexes must be a k x %d array.", (int) tuple_size);
+        goto out;
+    }
+    num_index_tuples = shape[0];
+
+    result_array = TreeSequence_allocate_results_array(
+        self, options, num_windows, num_index_tuples);
+    if (result_array == NULL) {
+        goto out;
+    }
+    err = method(self->tree_sequence, w_shape[1], PyArray_DATA(weights_array),
+        num_index_tuples, PyArray_DATA(indexes_array), num_windows,
+        PyArray_DATA(windows_array), PyArray_DATA(result_array), options);
+    if (err != 0) {
+        handle_library_error(err);
+        goto out;
+    }
+    ret = (PyObject *) result_array;
+    result_array = NULL;
+out:
+    Py_XDECREF(weights_array);
+    Py_XDECREF(indexes_array);
+    Py_XDECREF(windows_array);
+    Py_XDECREF(result_array);
+    return ret;
+}
+
+static PyObject *
 TreeSequence_divergence(TreeSequence *self, PyObject *args, PyObject *kwds)
 {
     return TreeSequence_k_way_stat_method(self, args, kwds, 2, tsk_treeseq_divergence);
@@ -9605,6 +9733,14 @@ TreeSequence_genetic_relatedness(TreeSequence *self, PyObject *args, PyObject *k
 {
     return TreeSequence_k_way_stat_method(
         self, args, kwds, 2, tsk_treeseq_genetic_relatedness);
+}
+
+static PyObject *
+TreeSequence_genetic_relatedness_weighted(
+    TreeSequence *self, PyObject *args, PyObject *kwds)
+{
+    return TreeSequence_k_way_weighted_stat_method(
+        self, args, kwds, 2, tsk_treeseq_genetic_relatedness_weighted);
 }
 
 static PyObject *
@@ -9635,6 +9771,84 @@ static PyObject *
 TreeSequence_f4(TreeSequence *self, PyObject *args, PyObject *kwds)
 {
     return TreeSequence_k_way_stat_method(self, args, kwds, 4, tsk_treeseq_f4);
+}
+
+static PyObject *
+TreeSequence_divergence_matrix(TreeSequence *self, PyObject *args, PyObject *kwds)
+{
+    PyObject *ret = NULL;
+    static char *kwlist[] = { "windows", "samples", "mode", "span_normalise", NULL };
+    PyArrayObject *result_array = NULL;
+    PyObject *windows = NULL;
+    PyObject *py_samples = Py_None;
+    char *mode = NULL;
+    PyArrayObject *windows_array = NULL;
+    PyArrayObject *samples_array = NULL;
+    tsk_flags_t options = 0;
+    npy_intp *shape, dims[3];
+    tsk_size_t num_samples, num_windows;
+    tsk_id_t *samples = NULL;
+    int span_normalise = 0;
+    int err;
+
+    if (TreeSequence_check_state(self) != 0) {
+        goto out;
+    }
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|Osi", kwlist, &windows, &py_samples,
+            &mode, &span_normalise)) {
+        goto out;
+    }
+    num_samples = tsk_treeseq_get_num_samples(self->tree_sequence);
+    if (py_samples != Py_None) {
+        samples_array = (PyArrayObject *) PyArray_FROMANY(
+            py_samples, NPY_INT32, 1, 1, NPY_ARRAY_IN_ARRAY);
+        if (samples_array == NULL) {
+            goto out;
+        }
+        shape = PyArray_DIMS(samples_array);
+        samples = PyArray_DATA(samples_array);
+        num_samples = (tsk_size_t) shape[0];
+    }
+    if (parse_windows(windows, &windows_array, &num_windows) != 0) {
+        goto out;
+    }
+    dims[0] = num_windows;
+    dims[1] = num_samples;
+    dims[2] = num_samples;
+    result_array = (PyArrayObject *) PyArray_SimpleNew(3, dims, NPY_FLOAT64);
+    if (result_array == NULL) {
+        goto out;
+    }
+
+    if (parse_stats_mode(mode, &options) != 0) {
+        goto out;
+    }
+    if (span_normalise) {
+        options |= TSK_STAT_SPAN_NORMALISE;
+    }
+
+    // clang-format off
+    Py_BEGIN_ALLOW_THREADS
+    err = tsk_treeseq_divergence_matrix(
+        self->tree_sequence,
+        num_samples, samples,
+        num_windows, PyArray_DATA(windows_array),
+        options, PyArray_DATA(result_array));
+    Py_END_ALLOW_THREADS
+        // clang-format on
+        /* Clang-format insists on doing this in spite of the "off" instruction above */
+        if (err != 0)
+    {
+        handle_library_error(err);
+        goto out;
+    }
+    ret = (PyObject *) result_array;
+    result_array = NULL;
+out:
+    Py_XDECREF(result_array);
+    Py_XDECREF(windows_array);
+    Py_XDECREF(samples_array);
+    return ret;
 }
 
 static PyObject *
@@ -10321,6 +10535,10 @@ static PyMethodDef TreeSequence_methods[] = {
         .ml_meth = (PyCFunction) TreeSequence_genetic_relatedness,
         .ml_flags = METH_VARARGS | METH_KEYWORDS,
         .ml_doc = "Computes genetic relatedness between sample sets." },
+    { .ml_name = "genetic_relatedness_weighted",
+        .ml_meth = (PyCFunction) TreeSequence_genetic_relatedness_weighted,
+        .ml_flags = METH_VARARGS | METH_KEYWORDS,
+        .ml_doc = "Computes genetic relatedness between weighted sums of samples." },
     { .ml_name = "Y1",
         .ml_meth = (PyCFunction) TreeSequence_Y1,
         .ml_flags = METH_VARARGS | METH_KEYWORDS,
@@ -10345,10 +10563,18 @@ static PyMethodDef TreeSequence_methods[] = {
         .ml_meth = (PyCFunction) TreeSequence_f4,
         .ml_flags = METH_VARARGS | METH_KEYWORDS,
         .ml_doc = "Computes the f4 statistic." },
+    { .ml_name = "divergence_matrix",
+        .ml_meth = (PyCFunction) TreeSequence_divergence_matrix,
+        .ml_flags = METH_VARARGS | METH_KEYWORDS,
+        .ml_doc = "Computes the pairwise divergence matrix." },
     { .ml_name = "split_edges",
         .ml_meth = (PyCFunction) TreeSequence_split_edges,
         .ml_flags = METH_VARARGS | METH_KEYWORDS,
         .ml_doc = "Returns a copy of this tree sequence edges split at time t" },
+    { .ml_name = "extend_edges",
+        .ml_meth = (PyCFunction) TreeSequence_extend_edges,
+        .ml_flags = METH_VARARGS | METH_KEYWORDS,
+        .ml_doc = "Extends edges, creating unary nodes." },
     { .ml_name = "has_reference_sequence",
         .ml_meth = (PyCFunction) TreeSequence_has_reference_sequence,
         .ml_flags = METH_NOARGS,
@@ -10649,6 +10875,29 @@ Tree_seek(Tree *self, PyObject *args)
         goto out;
     }
     err = tsk_tree_seek(self->tree, position, 0);
+    if (err != 0) {
+        handle_library_error(err);
+        goto out;
+    }
+    ret = Py_BuildValue("");
+out:
+    return ret;
+}
+
+static PyObject *
+Tree_seek_index(Tree *self, PyObject *args)
+{
+    PyObject *ret = NULL;
+    tsk_id_t index = 0;
+    int err;
+
+    if (Tree_check_state(self) != 0) {
+        goto out;
+    }
+    if (!PyArg_ParseTuple(args, "O&", tsk_id_converter, &index)) {
+        goto out;
+    }
+    err = tsk_tree_seek_index(self->tree, index, 0);
     if (err != 0) {
         handle_library_error(err);
         goto out;
@@ -11796,6 +12045,10 @@ static PyMethodDef Tree_methods[] = {
         .ml_meth = (PyCFunction) Tree_seek,
         .ml_flags = METH_VARARGS,
         .ml_doc = "Seeks to the tree at the specified position" },
+    { .ml_name = "seek_index",
+        .ml_meth = (PyCFunction) Tree_seek_index,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "Seeks to the tree at the specified index" },
     { .ml_name = "clear",
         .ml_meth = (PyCFunction) Tree_clear,
         .ml_flags = METH_NOARGS,
@@ -13058,6 +13311,64 @@ out:
 }
 
 static PyObject *
+LsHmm_backward_matrix(LsHmm *self, PyObject *args)
+{
+    int err;
+    PyObject *ret = NULL;
+    PyObject *haplotype = NULL;
+    PyObject *forward_norm = NULL;
+    CompressedMatrix *compressed_matrix = NULL;
+    PyArrayObject *haplotype_array = NULL;
+    PyArrayObject *forward_norm_array = NULL;
+    npy_intp *shape, num_sites;
+
+    if (LsHmm_check_state(self) != 0) {
+        goto out;
+    }
+    if (!PyArg_ParseTuple(args, "OOO!", &haplotype, &forward_norm, &CompressedMatrixType,
+            &compressed_matrix)) {
+        goto out;
+    }
+    num_sites = (npy_intp) tsk_treeseq_get_num_sites(self->tree_sequence->tree_sequence);
+
+    haplotype_array = (PyArrayObject *) PyArray_FROMANY(
+        haplotype, NPY_INT32, 1, 1, NPY_ARRAY_IN_ARRAY);
+    if (haplotype_array == NULL) {
+        goto out;
+    }
+    shape = PyArray_DIMS(haplotype_array);
+    if (shape[0] != num_sites) {
+        PyErr_SetString(
+            PyExc_ValueError, "haplotype array must have dimension (num_sites,)");
+        goto out;
+    }
+
+    forward_norm_array = (PyArrayObject *) PyArray_FROMANY(
+        forward_norm, NPY_FLOAT64, 1, 1, NPY_ARRAY_IN_ARRAY);
+    if (forward_norm_array == NULL) {
+        goto out;
+    }
+    shape = PyArray_DIMS(forward_norm_array);
+    if (shape[0] != num_sites) {
+        PyErr_SetString(
+            PyExc_ValueError, "forward_norm array must have dimension (num_sites,)");
+        goto out;
+    }
+    err = tsk_ls_hmm_backward(self->ls_hmm, PyArray_DATA(haplotype_array),
+        PyArray_DATA(forward_norm_array), compressed_matrix->compressed_matrix,
+        TSK_NO_INIT);
+    if (err != 0) {
+        handle_library_error(err);
+        goto out;
+    }
+    ret = Py_BuildValue("");
+out:
+    Py_XDECREF(haplotype_array);
+    Py_XDECREF(forward_norm_array);
+    return ret;
+}
+
+static PyObject *
 LsHmm_viterbi_matrix(LsHmm *self, PyObject *args)
 {
     int err;
@@ -13103,6 +13414,10 @@ static PyMethodDef LsHmm_methods[] = {
         .ml_meth = (PyCFunction) LsHmm_forward_matrix,
         .ml_flags = METH_VARARGS,
         .ml_doc = "Returns the tree encoded forward matrix for a given haplotype" },
+    { .ml_name = "backward_matrix",
+        .ml_meth = (PyCFunction) LsHmm_backward_matrix,
+        .ml_flags = METH_VARARGS,
+        .ml_doc = "Returns the tree encoded backward matrix for a given haplotype" },
     { .ml_name = "viterbi_matrix",
         .ml_meth = (PyCFunction) LsHmm_viterbi_matrix,
         .ml_flags = METH_VARARGS,

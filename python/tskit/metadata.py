@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2020-2022 Tskit Developers
+# Copyright (c) 2020-2023 Tskit Developers
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -46,9 +46,9 @@ __builtins__object__setattr__ = builtins.object.__setattr__
 
 
 def replace_root_refs(obj):
-    if type(obj) == list:
+    if type(obj) is list:
         return [replace_root_refs(j) for j in obj]
-    elif type(obj) == dict:
+    elif type(obj) is dict:
         ret = {k: replace_root_refs(v) for k, v in obj.items()}
         if ret.get("$ref") == "#":
             ret["$ref"] = "#/definitions/root"
@@ -193,7 +193,11 @@ def binary_format_validator(validator, types, instance, schema):
     # generators of exceptions, hence the yielding
 
     # Make sure the normal type validation gets done
-    yield from jsonschema._validators.type(validator, types, instance, schema)
+    try:
+        yield from jsonschema._validators.type(validator, types, instance, schema)
+    except AttributeError:
+        # Needed since jsonschema==4.19.1
+        yield from jsonschema._keywords.type(validator, types, instance, schema)
 
     # Non-composite types must have a binaryFormat
     if validator.is_type(instance, "object"):
@@ -222,7 +226,13 @@ def binary_format_validator(validator, types, instance, schema):
 
 def required_validator(validator, required, instance, schema):
     # Do the normal validation
-    yield from jsonschema._validators.required(validator, required, instance, schema)
+    try:
+        yield from jsonschema._validators.required(
+            validator, required, instance, schema
+        )
+    except AttributeError:
+        # Needed since jsonschema==4.19.1
+        yield from jsonschema._keywords.required(validator, required, instance, schema)
 
     # For struct codec if a property is not required, then it must have a default
     for prop, sub_schema in instance["properties"].items():
@@ -548,9 +558,9 @@ class StructCodec(AbstractMetadataCodec):
         # we add it here, sadly we can't do this in the metaschema as "default" isn't
         # used by the validator.
         def enforce_fixed_properties(obj):
-            if type(obj) == list:
+            if type(obj) is list:
                 return [enforce_fixed_properties(j) for j in obj]
-            elif type(obj) == dict:
+            elif type(obj) is dict:
                 ret = {k: enforce_fixed_properties(v) for k, v in obj.items()}
                 if "object" in ret.get("type", []):
                     if ret.get("additional_properties"):

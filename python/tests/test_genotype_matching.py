@@ -13,6 +13,25 @@ BOTH_HET = 7
 REF_HOM_OBS_HET = 1
 REF_HET_OBS_HOM = 2
 
+MISSING = -1
+
+
+def mirror_coordinates(ts):
+    """
+    Returns a copy of the specified tree sequence in which all
+    coordinates x are transformed into L - x.
+    """
+    L = ts.sequence_length
+    tables = ts.dump_tables()
+    left = tables.edges.left
+    right = tables.edges.right
+    tables.edges.left = L - right
+    tables.edges.right = L - left
+    tables.sites.position = L - tables.sites.position  # + 1
+    # TODO migrations.
+    tables.sort()
+    return tables.tree_sequence()
+
 
 class ValueTransition:
     """Simple struct holding value transition values."""
@@ -54,7 +73,9 @@ class InternalValueTransition:
 
 
 class LsHmmAlgorithm:
-    """Abstract superclass of Li and Stephens HMM algorithm."""
+    """
+    Abstract superclass of Li and Stephens HMM algorithm.
+    """
 
     def __init__(self, ts, rho, mu, precision=30):
         self.ts = ts
@@ -108,8 +129,8 @@ class LsHmmAlgorithm:
 
     def stupid_compress_dict(self):
         """
-        Duncan created a compression that just runs parsimony so
-        is guaranteed to work.
+        Duncan created a compression that just runs parsimony so is
+        guaranteed to work.
         """
         tree = self.tree
         T = self.T
@@ -154,8 +175,8 @@ class LsHmmAlgorithm:
         # Retain the old T_index, because the internal T that's passed up the tree will
         # retain this ordering.
         old_T_index = copy.deepcopy(self.T_index)
-        self.T_index = np.zeros(self.ts.num_nodes, dtype=int) - 1
-        self.N = np.zeros(self.ts.num_nodes, dtype=int)
+        self.T_index = np.zeros(tree.tree_sequence.num_nodes, dtype=int) - 1
+        self.N = np.zeros(tree.tree_sequence.num_nodes, dtype=int)
         self.T.clear()
 
         # First, create T root.
@@ -218,6 +239,7 @@ class LsHmmAlgorithm:
         # mapping_back[mut.derived_state]['value_list'][
         #   old_T_index[mapping_back[mut2.derived_state]["tree_node"]
         # ] and append this to the T_inner.
+
         node_map = {st.tree_node: st for st in self.T}
 
         for u in tree.samples():
@@ -314,8 +336,8 @@ class LsHmmAlgorithm:
         for vt in T:
             if vt.tree_node != -1:
                 if parent[vt.tree_node] == -1 and vt.value_index != -2:
-                    # Also need to mark the corresponding InternalValueTransition
-                    # as unused for the remaining states
+                    # Also need to mark the corresponding InternalValueTransition as
+                    # unused for the remaining states
                     for st2 in T:
                         if not (st2.value_list == tskit.NULL):
                             st2.value_list[T_index[vt.tree_node]].value = -1
@@ -324,7 +346,7 @@ class LsHmmAlgorithm:
                     vt.tree_node = -1
                 vt.value_index = -1
 
-        self.N = np.zeros(self.ts.num_nodes, dtype=int)
+        self.N = np.zeros(self.tree.tree_sequence.num_nodes, dtype=int)
         node_map = {st.tree_node: st for st in self.T}
 
         for u in self.tree.samples():
@@ -354,10 +376,15 @@ class LsHmmAlgorithm:
                     if st2.tree_node != -1:
                         self.T[self.T_index[st1.tree_node]].value_list[
                             self.T_index[st2.tree_node]
-                        ].inner_summation = max(
-                            normalisation_factor_inner[st1.tree_node],
-                            normalisation_factor_inner[st2.tree_node],
+                        ].inner_summation = self.inner_summation_evaluation(
+                            normalisation_factor_inner,
+                            st1.tree_node,
+                            st2.tree_node,
                         )
+                        # (
+                        #     normalisation_factor_inner[st1.tree_node]
+                        #     + normalisation_factor_inner[st2.tree_node]
+                        # )
 
         for mutation in site.mutations:
             u = mutation.node
@@ -390,6 +417,7 @@ class LsHmmAlgorithm:
         ]
 
         query_is_het = genotype_state == 1
+        query_is_missing = genotype_state == MISSING
 
         for st1 in T:
             u1 = st1.tree_node
@@ -423,8 +451,11 @@ class LsHmmAlgorithm:
                             match,
                             template_is_het,
                             query_is_het,
+                            query_is_missing,
                             u1,
                             u2,
+                            # Last two are not used by forward-backward
+                            # but required by Viterbi
                         )
 
                 # This will ensure that allelic_state[:n] is filled
@@ -440,24 +471,72 @@ class LsHmmAlgorithm:
         for mutation in site.mutations:
             allelic_state[mutation.node] = -1
 
-    def process_site(self, site, genotype_state):
-        self.update_probabilities(site, genotype_state)
-        self.stupid_compress_dict()
-        s1 = self.compute_normalisation_factor_dict()
-        T = self.T
+    def process_site(
+        self, site, genotype_state, forwards=True
+    ):  # Note: forwards turned on for Viterbi
+        if forwards:
+            # Forwards algorithm
+            self.update_probabilities(site, genotype_state)
+            self.stupid_compress_dict()
+            s1 = self.compute_normalisation_factor_dict()
+            T = self.T
 
-        for st in T:
-            if st.tree_node != tskit.NULL:
-                # Need to loop through value copy, and normalise
-                for st2 in st.value_list:
-                    st2.value /= s1
-                    st2.value = np.round(st2.value, self.precision)
+            for st in T:
+                if st.tree_node != tskit.NULL:
+                    # Need to loop through value copy, and normalise
+                    for st2 in st.value_list:
+                        st2.value /= s1
+                        st2.value = np.round(st2.value, self.precision)
 
-        self.output.store_site(
-            site.id, s1, [(st.tree_node, st.value_list) for st in self.T]
-        )
+            self.output.store_site(
+                site.id, s1, [(st.tree_node, st.value_list) for st in self.T]
+            )
+        else:
+            # Backwards algorithm
+            self.output.store_site(
+                site.id,
+                self.output.normalisation_factor[site.id],
+                [(st.tree_node, st.value_list) for st in self.T],
+            )
+            self.update_probabilities(site, genotype_state)
+            self.stupid_compress_dict()
+            b_last_sum = self.compute_normalisation_factor_dict()  # (Double sum)
 
-    def run_viterbi(self, g):
+            normalisation_factor_inner = {}
+
+            for st1 in self.T:
+                if st1.tree_node != -1:
+                    normalisation_factor_inner[
+                        st1.tree_node
+                    ] = self.compute_normalisation_factor_inner_dict(st1.tree_node)
+
+            for st1 in self.T:
+                if st1.tree_node != -1:
+                    for st2 in st1.value_list:
+                        if st2.tree_node != -1:
+                            self.T[self.T_index[st1.tree_node]].value_list[
+                                self.T_index[st2.tree_node]
+                            ].inner_summation = (
+                                normalisation_factor_inner[st1.tree_node]
+                                + normalisation_factor_inner[st2.tree_node]
+                            )
+
+            s = self.output.normalisation_factor[site.id]
+            for st1 in self.T:
+                if st1.tree_node != tskit.NULL:
+                    for st2 in st1.value_list:
+                        st2.value = (
+                            ((self.rho[site.id] / self.ts.num_samples) ** 2)
+                            * b_last_sum
+                            + (1 - self.rho[site.id])
+                            * (self.rho[site.id] / self.ts.num_samples)
+                            * st2.inner_summation
+                            + (1 - self.rho[site.id]) ** 2 * st2.value
+                        )
+                        st2.value /= s
+                        st2.value = np.round(st2.value, self.precision)
+
+    def run_forward(self, g):
         n = self.ts.num_samples
         self.tree.clear()
         for u in self.ts.samples():
@@ -475,6 +554,22 @@ class LsHmmAlgorithm:
 
         return self.output
 
+    def run_backward(self, g):
+        self.tree.clear()
+        for u in self.ts.samples():
+            self.T_index[u] = len(self.T)
+            self.T.append(ValueTransition(tree_node=u, value_list=[]))
+            for v in self.ts.samples():
+                self.T[self.T_index[u]].value_list.append(
+                    InternalValueTransition(tree_node=v, value=1)
+                )
+
+        while self.tree.next():
+            self.update_tree()
+            for site in self.tree.sites():
+                self.process_site(site, g[site.id], forwards=False)
+        return self.output
+
     def compute_normalisation_factor_dict(self):
         raise NotImplementedError()
 
@@ -486,7 +581,8 @@ class LsHmmAlgorithm:
         is_match,
         template_is_het,
         query_is_het,
-        node_1,
+        query_is_missing,
+        node_1,  # Note: these are only used in Viterbi (node_1 and node_2)
         node_2,
     ):
         raise NotImplementedError()
@@ -554,6 +650,14 @@ class CompressedMatrix:
             for site in tree.sites():
                 A[site.id] = self.decode_site_dict(tree, site.id)
         return A
+
+
+class ForwardMatrix(CompressedMatrix):
+    """Class representing a compressed forward matrix."""
+
+
+class BackwardMatrix(CompressedMatrix):
+    """Class representing a compressed forward matrix."""
 
 
 class ViterbiMatrix(CompressedMatrix):
@@ -788,6 +892,160 @@ class ViterbiMatrix(CompressedMatrix):
         return match
 
 
+class ForwardAlgorithm(LsHmmAlgorithm):
+    """Runs the Li and Stephens forward algorithm."""
+
+    def __init__(self, ts, rho, mu, precision=30):
+        super().__init__(ts, rho, mu, precision)
+        self.output = ForwardMatrix(ts)
+
+    def inner_summation_evaluation(
+        self, normalisation_factor_inner, st1_tree_node, st2_tree_node
+    ):
+        return (
+            normalisation_factor_inner[st1_tree_node]
+            + normalisation_factor_inner[st2_tree_node]
+        )
+
+    def compute_normalisation_factor_dict(self):
+        s = 0
+        for j, st in enumerate(self.T):
+            assert st.tree_node != tskit.NULL
+            assert self.N[j] > 0
+            s += self.N[j] * self.compute_normalisation_factor_inner_dict(st.tree_node)
+        return s
+
+    def compute_normalisation_factor_inner_dict(self, node):
+        s_inner = 0
+        F_previous = self.T[self.T_index[node]].value_list
+        for st in F_previous:
+            j = st.tree_node
+            if j != -1:
+                s_inner += self.N[self.T_index[j]] * st.value
+        return s_inner
+
+    def compute_next_probability_dict(
+        self,
+        site_id,
+        p_last,
+        inner_normalisation_factor,
+        is_match,
+        template_is_het,
+        query_is_het,
+        query_is_missing,
+        node_1,
+        node_2,
+    ):
+        rho = self.rho[site_id]
+        mu = self.mu[site_id]
+        n = self.ts.num_samples
+
+        p_t = (
+            (rho / n) ** 2
+            + ((1 - rho) * (rho / n)) * inner_normalisation_factor
+            + (1 - rho) ** 2 * p_last
+        )
+
+        if query_is_missing:
+            p_e = 1
+        else:
+            query_is_hom = np.logical_not(query_is_het)
+            template_is_hom = np.logical_not(template_is_het)
+
+            equal_both_hom = np.logical_and(
+                np.logical_and(is_match, template_is_hom), query_is_hom
+            )
+            unequal_both_hom = np.logical_and(
+                np.logical_and(np.logical_not(is_match), template_is_hom), query_is_hom
+            )
+            both_het = np.logical_and(template_is_het, query_is_het)
+            ref_hom_obs_het = np.logical_and(template_is_hom, query_is_het)
+            ref_het_obs_hom = np.logical_and(template_is_het, query_is_hom)
+
+            p_e = (
+                equal_both_hom * (1 - mu) ** 2
+                + unequal_both_hom * (mu**2)
+                + ref_hom_obs_het * (2 * mu * (1 - mu))
+                + ref_het_obs_hom * (mu * (1 - mu))
+                + both_het * ((1 - mu) ** 2 + mu**2)
+            )
+
+        return p_t * p_e
+
+
+class BackwardAlgorithm(LsHmmAlgorithm):
+    """Runs the Li and Stephens forward algorithm."""
+
+    def __init__(self, ts, rho, mu, normalisation_factor, precision=10):
+        super().__init__(ts, rho, mu, precision)
+        self.output = BackwardMatrix(ts, normalisation_factor)
+
+    def inner_summation_evaluation(
+        self, normalisation_factor_inner, st1_tree_node, st2_tree_node
+    ):
+        return (
+            normalisation_factor_inner[st1_tree_node]
+            + normalisation_factor_inner[st2_tree_node]
+        )
+
+    def compute_normalisation_factor_dict(self):
+        s = 0
+        for j, st in enumerate(self.T):
+            assert st.tree_node != tskit.NULL
+            assert self.N[j] > 0
+            s += self.N[j] * self.compute_normalisation_factor_inner_dict(st.tree_node)
+        return s
+
+    def compute_normalisation_factor_inner_dict(self, node):
+        s_inner = 0
+        F_previous = self.T[self.T_index[node]].value_list
+        for st in F_previous:
+            j = st.tree_node
+            if j != -1:
+                s_inner += self.N[self.T_index[j]] * st.value
+        return s_inner
+
+    def compute_next_probability_dict(
+        self,
+        site_id,
+        p_next,
+        inner_normalisation_factor,
+        is_match,
+        template_is_het,
+        query_is_het,
+        query_is_missing,
+        node_1,
+        node_2,
+    ):
+        mu = self.mu[site_id]
+        template_is_hom = np.logical_not(template_is_het)
+
+        if query_is_missing:
+            p_e = 1
+        else:
+            query_is_hom = np.logical_not(query_is_het)
+
+            equal_both_hom = np.logical_and(
+                np.logical_and(is_match, template_is_hom), query_is_hom
+            )
+            unequal_both_hom = np.logical_and(
+                np.logical_and(np.logical_not(is_match), template_is_hom), query_is_hom
+            )
+            both_het = np.logical_and(template_is_het, query_is_het)
+            ref_hom_obs_het = np.logical_and(template_is_hom, query_is_het)
+            ref_het_obs_hom = np.logical_and(template_is_het, query_is_hom)
+
+            p_e = (
+                equal_both_hom * (1 - mu) ** 2
+                + unequal_both_hom * (mu**2)
+                + ref_hom_obs_het * (2 * mu * (1 - mu))
+                + ref_het_obs_hom * (mu * (1 - mu))
+                + both_het * ((1 - mu) ** 2 + mu**2)
+            )
+
+        return p_next * p_e
+
+
 class ViterbiAlgorithm(LsHmmAlgorithm):
     """
     Runs the Li and Stephens Viterbi algorithm.
@@ -796,6 +1054,14 @@ class ViterbiAlgorithm(LsHmmAlgorithm):
     def __init__(self, ts, rho, mu, precision=10):
         super().__init__(ts, rho, mu, precision)
         self.output = ViterbiMatrix(ts)
+
+    def inner_summation_evaluation(
+        self, normalisation_factor_inner, st1_tree_node, st2_tree_node
+    ):
+        return max(
+            normalisation_factor_inner[st1_tree_node],
+            normalisation_factor_inner[st2_tree_node],
+        )
 
     def compute_normalisation_factor_dict(self):
         s = 0
@@ -830,6 +1096,7 @@ class ViterbiAlgorithm(LsHmmAlgorithm):
         is_match,
         template_is_het,
         query_is_het,
+        query_is_missing,
         node_1,
         node_2,
     ):
@@ -841,26 +1108,28 @@ class ViterbiAlgorithm(LsHmmAlgorithm):
         double_recombination_required = False
         single_recombination_required = False
 
-        template_is_hom = np.logical_not(template_is_het)
-        query_is_hom = np.logical_not(query_is_het)
+        if query_is_missing:
+            p_e = 1
+        else:
+            template_is_hom = np.logical_not(template_is_het)
+            query_is_hom = np.logical_not(query_is_het)
+            equal_both_hom = np.logical_and(
+                np.logical_and(is_match, template_is_hom), query_is_hom
+            )
+            unequal_both_hom = np.logical_and(
+                np.logical_and(np.logical_not(is_match), template_is_hom), query_is_hom
+            )
+            both_het = np.logical_and(template_is_het, query_is_het)
+            ref_hom_obs_het = np.logical_and(template_is_hom, query_is_het)
+            ref_het_obs_hom = np.logical_and(template_is_het, query_is_hom)
 
-        EQUAL_BOTH_HOM = np.logical_and(
-            np.logical_and(is_match, template_is_hom), query_is_hom
-        )
-        UNEQUAL_BOTH_HOM = np.logical_and(
-            np.logical_and(np.logical_not(is_match), template_is_hom), query_is_hom
-        )
-        BOTH_HET = np.logical_and(template_is_het, query_is_het)
-        REF_HOM_OBS_HET = np.logical_and(template_is_hom, query_is_het)
-        REF_HET_OBS_HOM = np.logical_and(template_is_het, query_is_hom)
-
-        p_e = (
-            EQUAL_BOTH_HOM * (1 - mu) ** 2
-            + UNEQUAL_BOTH_HOM * (mu**2)
-            + REF_HOM_OBS_HET * (2 * mu * (1 - mu))
-            + REF_HET_OBS_HOM * (mu * (1 - mu))
-            + BOTH_HET * ((1 - mu) ** 2 + mu**2)
-        )
+            p_e = (
+                equal_both_hom * (1 - mu) ** 2
+                + unequal_both_hom * (mu**2)
+                + ref_hom_obs_het * (2 * mu * (1 - mu))
+                + ref_het_obs_hom * (mu * (1 - mu))
+                + both_het * ((1 - mu) ** 2 + mu**2)
+            )
 
         no_switch = (1 - r) ** 2 + 2 * (r_n * (1 - r)) + r_n**2
         single_switch = r_n * (1 - r) + r_n**2
@@ -891,12 +1160,26 @@ class ViterbiAlgorithm(LsHmmAlgorithm):
         return p_t * p_e
 
 
+def ls_forward_tree(g, ts, rho, mu, precision=30):
+    """Forward matrix computation based on a tree sequence."""
+    fa = ForwardAlgorithm(ts, rho, mu, precision=precision)
+    return fa.run_forward(g)
+
+
+def ls_backward_tree(g, ts_mirror, rho, mu, normalisation_factor, precision=30):
+    """Backward matrix computation based on a tree sequence."""
+    ba = BackwardAlgorithm(
+        ts_mirror, rho, mu, normalisation_factor, precision=precision
+    )
+    return ba.run_backward(g)
+
+
 def ls_viterbi_tree(g, ts, rho, mu, precision=30):
     """
     Viterbi path computation based on a tree sequence.
     """
     va = ViterbiAlgorithm(ts, rho, mu, precision=precision)
-    return va.run_viterbi(g)
+    return va.run_forward(g)
 
 
 class LSBase:
@@ -914,10 +1197,24 @@ class LSBase:
         return e
 
     def example_genotypes(self, ts):
-
         H = ts.genotype_matrix()
         s = H[:, 0].reshape(1, H.shape[0]) + H[:, 1].reshape(1, H.shape[0])
         H = H[:, 2:]
+
+        genotypes = [
+            s,
+            H[:, -1].reshape(1, H.shape[0]) + H[:, -2].reshape(1, H.shape[0]),
+        ]
+
+        s_tmp = s.copy()
+        s_tmp[0, -1] = MISSING
+        genotypes.append(s_tmp)
+        s_tmp = s.copy()
+        s_tmp[0, ts.num_sites // 2] = MISSING
+        genotypes.append(s_tmp)
+        s_tmp = s.copy()
+        s_tmp[0, :] = MISSING
+        genotypes.append(s_tmp)
 
         m = ts.get_num_sites()
         n = H.shape[1]
@@ -926,11 +1223,11 @@ class LSBase:
         for i in range(m):
             G[i, :, :] = np.add.outer(H[i, :], H[i, :])
 
-        return H, G, s
+        return H, G, genotypes
 
     def example_parameters_genotypes(self, ts, seed=42):
         np.random.seed(seed)
-        H, G, s = self.example_genotypes(ts)
+        H, G, genotypes = self.example_genotypes(ts)
         n = H.shape[1]
         m = ts.get_num_sites()
 
@@ -941,12 +1238,14 @@ class LSBase:
 
         e = self.genotype_emission(mu, m)
 
-        yield n, m, G, s, e, r, mu
+        for s in genotypes:
+            yield n, m, G, s, e, r, mu
 
         # Mixture of random and extremes
         rs = [np.zeros(m) + 0.999, np.zeros(m) + 1e-6, np.random.rand(m)]
         mus = [np.zeros(m) + 0.33, np.zeros(m) + 1e-6, np.random.rand(m) * 0.33]
 
+        s = genotypes[0]
         for r, mu in itertools.product(rs, mus):
             r[0] = 0
             e = self.genotype_emission(mu, m)
@@ -965,23 +1264,8 @@ class LSBase:
         assert ts.num_sites > 3
         self.verify(ts)
 
-    def test_simple_n_10_no_recombination_high_mut(self):
-        ts = msprime.simulate(10, recombination_rate=0, mutation_rate=3, random_seed=42)
-        assert ts.num_sites > 3
-        self.verify(ts)
-
-    def test_simple_n_10_no_recombination_higher_mut(self):
-        ts = msprime.simulate(20, recombination_rate=0, mutation_rate=3, random_seed=42)
-        assert ts.num_sites > 3
-        self.verify(ts)
-
     def test_simple_n_6(self):
         ts = msprime.simulate(6, recombination_rate=2, mutation_rate=7, random_seed=42)
-        assert ts.num_sites > 5
-        self.verify(ts)
-
-    def test_simple_n_8(self):
-        ts = msprime.simulate(8, recombination_rate=2, mutation_rate=5, random_seed=42)
         assert ts.num_sites > 5
         self.verify(ts)
 
@@ -991,10 +1275,33 @@ class LSBase:
         assert ts.num_sites > 5
         self.verify(ts)
 
-    def test_simple_n_16(self):
-        ts = msprime.simulate(16, recombination_rate=2, mutation_rate=5, random_seed=42)
-        assert ts.num_sites > 5
-        self.verify(ts)
+    # FIXME Reducing the number of test cases here as they take a long time to run,
+    # and we will want to refactor the test infrastructure when implementing these
+    # diploid methods in the library.
+
+    # def test_simple_n_10_no_recombination_high_mut(self):
+    #     ts = msprime.simulate(
+    #         10, recombination_rate=0, mutation_rate=3, random_seed=42)
+    #     assert ts.num_sites > 3
+    #     self.verify(ts)
+
+    # def test_simple_n_10_no_recombination_higher_mut(self):
+    #     ts = msprime.simulate(
+    #         20, recombination_rate=0, mutation_rate=3, random_seed=42)
+    #     assert ts.num_sites > 3
+    #     self.verify(ts)
+
+    # def test_simple_n_8(self):
+    #     ts = msprime.simulate(
+    #         8, recombination_rate=2, mutation_rate=5, random_seed=42)
+    #     assert ts.num_sites > 5
+    #     self.verify(ts)
+
+    # def test_simple_n_16(self):
+    #     ts = msprime.simulate(
+    #         16, recombination_rate=2, mutation_rate=5, random_seed=42)
+    #     assert ts.num_sites > 5
+    #     self.verify(ts)
 
     def verify(self, ts):
         raise NotImplementedError()
@@ -1008,6 +1315,125 @@ class VitAlgorithmBase(LSBase):
     """Base for viterbi algoritm tests."""
 
 
+class TestMirroringDipdict(FBAlgorithmBase):
+    """Tests that mirroring the tree sequence and running forwards and backwards
+    algorithms give the same log-likelihood of observing the data."""
+
+    def verify(self, ts):
+        for n, m, _, s, _, r, mu in self.example_parameters_genotypes(ts):
+            # Note, need to remove the first sample from the ts, and ensure that
+            # invariant sites aren't removed.
+            ts_check, mapping = ts.simplify(
+                range(1, n + 1), filter_sites=False, map_nodes=True
+            )
+            G_check = np.zeros((m, n, n))
+            for i in range(m):
+                G_check[i, :, :] = np.add.outer(
+                    ts_check.genotype_matrix()[i, :], ts_check.genotype_matrix()[i, :]
+                )
+
+            cm_d = ls_forward_tree(s[0, :], ts_check, r, mu)
+            ll_tree = np.sum(np.log10(cm_d.normalisation_factor))
+
+            ts_check_mirror = mirror_coordinates(ts_check)
+            r_flip = np.insert(np.flip(r)[:-1], 0, 0)
+            cm_mirror = ls_forward_tree(
+                np.flip(s[0, :]), ts_check_mirror, r_flip, np.flip(mu)
+            )
+            ll_mirror_tree_dict = np.sum(np.log10(cm_mirror.normalisation_factor))
+
+            self.assertAllClose(ll_tree, ll_mirror_tree_dict)
+
+            # Ensure that the decoded matrices are the same
+            F_mirror_matrix, c, ll = ls.forwards(
+                np.flip(G_check, axis=0),
+                np.flip(s, axis=1),
+                r_flip,
+                p_mutation=np.flip(mu),
+                scale_mutation_based_on_n_alleles=False,
+            )
+
+            self.assertAllClose(F_mirror_matrix, cm_mirror.decode())
+
+
+class TestForwardDipTree(FBAlgorithmBase):
+    """Tests that the tree algorithm computes the same forward matrix as the simple
+    method."""
+
+    def verify(self, ts):
+        for n, m, _, s, _, r, mu in self.example_parameters_genotypes(ts):
+            # Note, need to remove the first sample from the ts, and ensure that
+            # invariant sites aren't removed.
+            ts_check, mapping = ts.simplify(
+                range(1, n + 1), filter_sites=False, map_nodes=True
+            )
+            G_check = np.zeros((m, n, n))
+            for i in range(m):
+                G_check[i, :, :] = np.add.outer(
+                    ts_check.genotype_matrix()[i, :], ts_check.genotype_matrix()[i, :]
+                )
+
+            F, c, ll = ls.forwards(
+                G_check, s, r, p_mutation=mu, scale_mutation_based_on_n_alleles=False
+            )
+            cm_d = ls_forward_tree(s[0, :], ts_check, r, mu)
+            self.assertAllClose(cm_d.decode(), F)
+            ll_tree = np.sum(np.log10(cm_d.normalisation_factor))
+            self.assertAllClose(ll, ll_tree)
+
+
+class TestForwardBackwardTree(FBAlgorithmBase):
+    """Tests that the tree algorithm computes the same forward matrix as the simple
+    method."""
+
+    def verify(self, ts):
+        for n, m, _, s, _, r, mu in self.example_parameters_genotypes(ts):
+            # Note, need to remove the first sample from the ts, and ensure that
+            # invariant sites aren't removed.
+            ts_check, mapping = ts.simplify(
+                range(1, n + 1), filter_sites=False, map_nodes=True
+            )
+            G_check = np.zeros((m, n, n))
+            for i in range(m):
+                G_check[i, :, :] = np.add.outer(
+                    ts_check.genotype_matrix()[i, :], ts_check.genotype_matrix()[i, :]
+                )
+
+            F, c, ll = ls.forwards(
+                G_check, s, r, p_mutation=mu, scale_mutation_based_on_n_alleles=False
+            )
+            B = ls.backwards(
+                G_check,
+                s,
+                c,
+                r,
+                p_mutation=mu,
+                scale_mutation_based_on_n_alleles=False,
+            )
+
+            # Note, need to remove the first sample from the ts, and ensure that
+            # invariant sites aren't removed.
+            ts_check = ts.simplify(range(1, n + 1), filter_sites=False)
+            c_f = ls_forward_tree(s[0, :], ts_check, r, mu)
+            ll_tree = np.sum(np.log10(c_f.normalisation_factor))
+
+            ts_check_mirror = mirror_coordinates(ts_check)
+            r_flip = np.flip(r)
+            c_b = ls_backward_tree(
+                np.flip(s[0, :]),
+                ts_check_mirror,
+                r_flip,
+                np.flip(mu),
+                np.flip(c_f.normalisation_factor),
+            )
+            B_tree = np.flip(c_b.decode(), axis=0)
+            F_tree = c_f.decode()
+
+            self.assertAllClose(B, B_tree)
+            self.assertAllClose(F, F_tree)
+            self.assertAllClose(ll, ll_tree)
+
+
 class TestTreeViterbiDip(VitAlgorithmBase):
     """
     Test that we have the same log-likelihood between tree and matrix
@@ -1015,7 +1441,6 @@ class TestTreeViterbiDip(VitAlgorithmBase):
     """
 
     def verify(self, ts):
-
         for n, m, _, s, _, r, mu in self.example_parameters_genotypes(ts):
             # Note, need to remove the first sample from the ts, and ensure that
             # invariant sites aren't removed.
@@ -1029,14 +1454,14 @@ class TestTreeViterbiDip(VitAlgorithmBase):
                 )
             ts_check = ts.simplify(range(1, n + 1), filter_sites=False)
             phased_path, ll = ls.viterbi(
-                G_check, s, r, mutation_rate=mu, scale_mutation_based_on_n_alleles=False
+                G_check, s, r, p_mutation=mu, scale_mutation_based_on_n_alleles=False
             )
             path_ll_matrix = ls.path_ll(
                 G_check,
                 s,
                 phased_path,
                 r,
-                mutation_rate=mu,
+                p_mutation=mu,
                 scale_mutation_based_on_n_alleles=False,
             )
 
@@ -1051,7 +1476,7 @@ class TestTreeViterbiDip(VitAlgorithmBase):
                 s,
                 np.transpose(path_tree_dict),
                 r,
-                mutation_rate=mu,
+                p_mutation=mu,
                 scale_mutation_based_on_n_alleles=False,
             )
 

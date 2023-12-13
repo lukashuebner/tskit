@@ -15,7 +15,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        python: [3.7, 3.8, 3.9, "3.10", 3.11]
+        python: [3.8, 3.9, "3.10", 3.11]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -55,7 +55,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        python: [3.7, 3.8, 3.9, "3.10", 3.11]
+        python: [3.8, 3.9, "3.10", 3.11]
         wordsize: [64]
     steps:
       - name: Checkout
@@ -140,7 +140,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        python: [3.7, 3.8, 3.9, "3.10", 3.11]
+        python: [3.8, 3.9, "3.10", 3.11]
     steps:
       - name: Download wheels
         uses: actions/download-artifact@v2
@@ -162,7 +162,7 @@ jobs:
     runs-on: windows-latest
     strategy:
       matrix:
-        python: [3.7, 3.8, 3.9, "3.10", 3.11]
+        python: [3.8, 3.9, "3.10", 3.11]
         wordsize: [64]
     steps:
       - name: Download wheels
@@ -186,10 +186,9 @@ jobs:
     needs: ['manylinux']
     strategy:
       matrix:
-        python: [3.7, 3.8, 3.9, "3.10", 3.11]
+        python: [3.8, 3.9, "3.10", 3.11]
         include:
-          - python: 3.7
-            wheel: cp37
+
           - python: 3.8
             wheel: cp38
           - python: 3.9
@@ -217,7 +216,10 @@ jobs:
 
   PyPI_Upload:
     runs-on: ubuntu-latest
+    environment: release
     needs: ['windows-test', 'OSX-test', 'manylinux-test']
+    permissions:
+      id-token: write
     steps:
       - name: Download all
         uses: actions/download-artifact@v2
@@ -227,12 +229,9 @@ jobs:
           cp */*.{whl,gz} dist/.
       - name: Publish distribution to Test PyPI
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags') && !contains(github.event.ref, 'C_')
-        uses: pypa/gh-action-pypi-publish@master
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.test_pypi_password }}
           repository_url: https://test.pypi.org/legacy/
       - name: Publish distribution to PRODUCTION PyPI
         if: github.event_name == 'release' && !startsWith(github.event.release.tag_name, 'C_')
-        uses: pypa/gh-action-pypi-publish@master
-        with:
-          password: ${{ secrets.pypi_password }}
+        uses: pypa/gh-action-pypi-publish@release/v1

@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2018-2022 Tskit Developers
+# Copyright (c) 2018-2023 Tskit Developers
 # Copyright (c) 2015-2017 University of Oxford
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -25,7 +25,6 @@ Module responsible for visualisations.
 """
 import collections
 import itertools
-import logging
 import math
 import numbers
 import operator
@@ -403,6 +402,7 @@ def draw_tree(
         warnings.warn(
             "tree_height_scale is deprecated; use time_scale instead",
             FutureWarning,
+            stacklevel=4,
         )
     if max_time is None and max_tree_height is not None:
         max_time = max_tree_height
@@ -410,6 +410,7 @@ def draw_tree(
         warnings.warn(
             "max_tree_height is deprecated; use max_time instead",
             FutureWarning,
+            stacklevel=4,
         )
 
     # See tree.draw() for documentation on these arguments.
@@ -1021,6 +1022,7 @@ class SvgTreeSequence(SvgAxisPlot):
             warnings.warn(
                 "max_tree_height is deprecated; use max_time instead",
                 FutureWarning,
+                stacklevel=4,
             )
         if time_scale is None and tree_height_scale is not None:
             time_scale = tree_height_scale
@@ -1028,6 +1030,7 @@ class SvgTreeSequence(SvgAxisPlot):
             warnings.warn(
                 "tree_height_scale is deprecated; use time_scale instead",
                 FutureWarning,
+                stacklevel=4,
             )
         x_lim = check_x_lim(x_lim, max_x=ts.sequence_length)
         ts, self.tree_status, offsets = clip_ts(ts, x_lim[0], x_lim[1], max_num_trees)
@@ -1230,7 +1233,6 @@ class SvgTreeSequence(SvgAxisPlot):
                 self.plotbox.pad_bottom + self.tree_plotbox.pad_bottom,
             )
         else:
-
             # For a treewise plot, the only time the x_transform is used is to apply
             # to tick positions, so simply use positions 0..num_used_breaks for the
             # positions, and a simple transform
@@ -1304,6 +1306,7 @@ class SvgTree(SvgAxisPlot):
             warnings.warn(
                 "max_tree_height is deprecated; use max_time instead",
                 FutureWarning,
+                stacklevel=4,
             )
         if time_scale is None and tree_height_scale is not None:
             time_scale = tree_height_scale
@@ -1311,6 +1314,7 @@ class SvgTree(SvgAxisPlot):
             warnings.warn(
                 "tree_height_scale is deprecated; use time_scale instead",
                 FutureWarning,
+                stacklevel=4,
             )
         if size is None:
             size = (200, 200)
@@ -1360,9 +1364,11 @@ class SvgTree(SvgAxisPlot):
                     else:
                         unplotted.append(mutation.id + self.offsets.mutation)
         if len(unplotted) > 0:
-            logging.warning(
+            warnings.warn(
                 f"Mutations {unplotted} are above nodes which are not present in the "
-                "displayed tree, so are not plotted on the topology."
+                "displayed tree, so are not plotted on the topology.",
+                UserWarning,
+                stacklevel=2,
             )
         self.left_extent = tree.interval.left
         self.right_extent = tree.interval.right

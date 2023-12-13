@@ -207,7 +207,7 @@ def insert_gap(ts, position, length):
     return tables.tree_sequence()
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_gap_examples():
     """
     Returns example tree sequences that contain gaps within the list of
@@ -228,18 +228,18 @@ def get_gap_examples():
                 assert len(t.parent_dict) == 0
                 found = True
         assert found
-        ret.append((f"gap {x}", ts))
+        ret.append((f"gap_{x}", ts))
     # Give an example with a gap at the end.
     ts = msprime.simulate(10, random_seed=5, recombination_rate=1)
     tables = get_table_collection_copy(ts.dump_tables(), 2)
     tables.sites.clear()
     tables.mutations.clear()
     insert_uniform_mutations(tables, 100, list(ts.samples()))
-    ret.append(("gap at end", tables.tree_sequence()))
+    ret.append(("gap_at_end", tables.tree_sequence()))
     return ret
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_internal_samples_examples():
     """
     Returns example tree sequences with internal samples.
@@ -270,7 +270,7 @@ def get_internal_samples_examples():
     return ret
 
 
-@functools.lru_cache()
+@functools.lru_cache
 def get_decapitated_examples():
     """
     Returns example tree sequences in which the oldest edges have been removed.
@@ -886,6 +886,10 @@ class TestTreeTraversals:
 
 
 class TestMRCA:
+    """
+    Test both the tree.mrca and tree.tmrca methods.
+    """
+
     t = tskit.Tree.generate_balanced(3)
     #  4
     # ┏━┻┓
@@ -893,35 +897,49 @@ class TestMRCA:
     # ┃ ┏┻┓
     # 0 1 2
 
-    def test_two_or_more_args(self):
-        assert self.t.mrca(2, 1) == 3
-        assert self.t.mrca(0, 1, 2) == 4
+    @pytest.mark.parametrize("args, expected", [((2, 1), 3), ((0, 1, 2), 4)])
+    def test_two_or_more_args(self, args, expected):
+        assert self.t.mrca(*args) == expected
+        assert self.t.tmrca(*args) == self.t.tree_sequence.nodes_time[expected]
 
     def test_less_than_two_args(self):
         with pytest.raises(ValueError):
             self.t.mrca(1)
+        with pytest.raises(ValueError):
+            self.t.tmrca(1)
 
     def test_no_args(self):
         with pytest.raises(ValueError):
             self.t.mrca()
+        with pytest.raises(ValueError):
+            self.t.tmrca()
 
     def test_same_args(self):
         assert self.t.mrca(0, 0, 0, 0) == 0
+        assert self.t.tmrca(0, 0, 0, 0) == self.t.tree_sequence.nodes_time[0]
 
     def test_different_tree_levels(self):
         assert self.t.mrca(0, 3) == 4
+        assert self.t.tmrca(0, 3) == self.t.tree_sequence.nodes_time[4]
 
     def test_out_of_bounds_args(self):
         with pytest.raises(ValueError):
             self.t.mrca(0, 6)
+        with pytest.raises(ValueError):
+            self.t.tmrca(0, 6)
 
     def test_virtual_root_arg(self):
         assert self.t.mrca(0, 5) == 5
+        assert np.isposinf(self.t.tmrca(0, 5))
 
     def test_multiple_roots(self):
         ts = tskit.Tree.generate_balanced(10).tree_sequence
         ts = ts.delete_intervals([ts.first().interval])
         assert ts.first().mrca(*ts.samples()) == tskit.NULL
+        # We decided to raise an error for tmrca here, rather than report inf
+        # see https://github.com/tskit-dev/tskit/issues/2801
+        with pytest.raises(ValueError, match="do not share a common ancestor"):
+            ts.first().tmrca(0, 6)
 
 
 class TestPathLength:
@@ -1220,7 +1238,7 @@ class TestNumpySamples:
 
     def test_samples_example(self):
         tables = tskit.TableCollection(sequence_length=10)
-        time = [np.array(0), 0, np.array([1]), 1, 1, 3, 3.00001, 3.0 - 0.0001, 1 / 3]
+        time = [0, 0, 1, 1, 1, 3, 3.00001, 3.0 - 0.0001, 1 / 3]
         pops = [1, 3, 1, 2, 1, 1, 1, 3, 1]
         for _ in range(max(pops) + 1):
             tables.populations.add_row()
@@ -2595,6 +2613,35 @@ class TestTreeSequence(HighLevelTestCase):
         assert_array_equal(
             ts.indexes_edge_removal_order, tables.indexes.edge_removal_order
         )
+
+    @pytest.mark.parametrize("ts", get_example_tree_sequences())
+    def test_impute_unknown_mutations_time(self, ts):
+        # Tests for method='min'
+        imputed_time = ts.impute_unknown_mutations_time(method="min")
+        mutations = ts.tables.mutations
+        nodes_time = ts.nodes_time
+        table_time = np.zeros(len(mutations))
+
+        for mut_idx, mut in enumerate(mutations):
+            if tskit.is_unknown_time(mut.time):
+                node_time = nodes_time[mut.node]
+                table_time[mut_idx] = node_time
+            else:
+                table_time[mut_idx] = mut.time
+
+        assert np.allclose(imputed_time, table_time, rtol=1e-10, atol=1e-10)
+
+        # Check we have valid times
+        tables = ts.dump_tables()
+        tables.mutations.time = imputed_time
+        tables.sort()
+        tables.tree_sequence()
+
+        # Test for unallowed methods
+        with pytest.raises(
+            ValueError, match="Mutations time imputation method must be chosen"
+        ):
+            ts.impute_unknown_mutations_time(method="foobar")
 
 
 class TestSimplify:
@@ -4578,7 +4625,7 @@ class TestSeekDirection:
     def ts(self):
         return tsutil.all_trees_ts(3)
 
-    def setup(self):
+    def get_tree_pair(self):
         ts = self.ts()
         t1 = tskit.Tree(ts)
         t2 = tskit.Tree(ts)
@@ -4591,22 +4638,25 @@ class TestSeekDirection:
     def test_index_from_different_directions(self, index):
         # Check that we get different orderings of the children arrays
         # for all trees when we go in different directions.
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         while t1.index != index:
             t1.next()
         while t2.index != index:
             t2.prev()
         assert_same_tree_different_order(t1, t2)
 
-    def test_seek_0_from_null(self):
-        t1, t2 = self.setup()
-        t1.first()
-        t2.seek(0)
+    @pytest.mark.parametrize("position", [0, 1, 2, 3])
+    def test_seek_from_null(self, position):
+        t1, t2 = self.get_tree_pair()
+        t1.clear()
+        t1.seek(position)
+        t2.first()
+        t2.seek(position)
         assert_trees_identical(t1, t2)
 
     @pytest.mark.parametrize("index", range(3))
     def test_seek_next_tree(self, index):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         while t1.index != index:
             t1.next()
             t2.next()
@@ -4616,7 +4666,7 @@ class TestSeekDirection:
 
     @pytest.mark.parametrize("index", [3, 2, 1])
     def test_seek_prev_tree(self, index):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         while t1.index != index:
             t1.prev()
             t2.prev()
@@ -4625,7 +4675,7 @@ class TestSeekDirection:
         assert_trees_identical(t1, t2)
 
     def test_seek_1_from_0(self):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         t1.first()
         t1.next()
         t2.first()
@@ -4633,7 +4683,7 @@ class TestSeekDirection:
         assert_trees_identical(t1, t2)
 
     def test_seek_1_5_from_0(self):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         t1.first()
         t1.next()
         t2.first()
@@ -4641,7 +4691,7 @@ class TestSeekDirection:
         assert_trees_identical(t1, t2)
 
     def test_seek_1_5_from_1(self):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         for _ in range(2):
             t1.next()
             t2.next()
@@ -4649,24 +4699,63 @@ class TestSeekDirection:
         assert_trees_identical(t1, t2)
 
     def test_seek_3_from_null(self):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         t1.last()
         t2.seek(3)
         assert_trees_identical(t1, t2)
 
+    def test_seek_3_from_null_prev(self):
+        t1, t2 = self.get_tree_pair()
+        t1.last()
+        t1.prev()
+        t2.seek(3)
+        t2.prev()
+        assert_trees_identical(t1, t2)
+
     def test_seek_3_from_0(self):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         t1.last()
         t2.first()
         t2.seek(3)
         assert_trees_identical(t1, t2)
 
     def test_seek_0_from_3(self):
-        t1, t2 = self.setup()
+        t1, t2 = self.get_tree_pair()
         t1.last()
         t1.first()
         t2.last()
         t2.seek(0)
+        assert_trees_identical(t1, t2)
+
+    @pytest.mark.parametrize("ts", get_example_tree_sequences())
+    def test_seek_mid_null_and_middle(self, ts):
+        breakpoints = ts.breakpoints(as_array=True)
+        mid = breakpoints[:-1] + np.diff(breakpoints) / 2
+        for index, x in enumerate(mid[:-1]):
+            t1 = tskit.Tree(ts)
+            t1.seek(x)
+            # Also seek to this point manually to make sure we're not
+            # reusing the seek from null under the hood.
+            t2 = tskit.Tree(ts)
+            if index <= ts.num_trees / 2:
+                while t2.index != index:
+                    t2.next()
+            else:
+                while t2.index != index:
+                    t2.prev()
+            assert t1.index == t2.index
+            assert np.all(t1.parent_array == t2.parent_array)
+
+    @pytest.mark.parametrize("ts", get_example_tree_sequences())
+    def test_seek_last_then_prev(self, ts):
+        t1 = tskit.Tree(ts)
+        t1.seek(ts.sequence_length - 0.00001)
+        assert t1.index == ts.num_trees - 1
+        t2 = tskit.Tree(ts)
+        t2.prev()
+        assert_trees_identical(t1, t2)
+        t1.prev()
+        t2.prev()
         assert_trees_identical(t1, t2)
 
 

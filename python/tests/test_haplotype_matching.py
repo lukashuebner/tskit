@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2019-2021 Tskit Developers
+# Copyright (c) 2019-2023 Tskit Developers
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,332 +20,59 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 """
-Python implementation of the Li and Stephens algorithms.
+Python implementation of the Li and Stephens forwards and backwards algorithms.
 """
-import itertools
-import unittest
+import warnings
 
+import lshmm as ls
 import msprime
 import numpy as np
+import numpy.testing as nt
 import pytest
 
-import _tskit  # TMP
+import _tskit
 import tskit
 from tests import tsutil
 
-
-def in_sorted(values, j):
-    # Take advantage of the fact that the numpy array is sorted.
-    ret = False
-    index = np.searchsorted(values, j)
-    if index < values.shape[0]:
-        ret = values[index] == j
-    return ret
+MISSING = -1
 
 
-def ls_forward_matrix_naive(h, alleles, G, rho, mu):
-    """
-    Simple matrix based method for LS forward algorithm using Python loops.
-    """
-    assert rho[0] == 0
-    m, n = G.shape
-    alleles = check_alleles(alleles, m)
-    F = np.zeros((m, n))
-    S = np.zeros(m)
-    f = np.zeros(n) + 1 / n
-
-    for el in range(0, m):
-        for j in range(n):
-            # NOTE Careful with the difference between this expression and
-            # the Viterbi algorithm below. This depends on the different
-            # normalisation approach.
-            p_t = f[j] * (1 - rho[el]) + rho[el] / n
-            p_e = mu[el]
-            if G[el, j] == h[el] or h[el] == tskit.MISSING_DATA:
-                p_e = 1 - (len(alleles[el]) - 1) * mu[el]
-            f[j] = p_t * p_e
-        S[el] = np.sum(f)
-        # TODO need to handle the 0 case.
-        assert S[el] > 0
-        f /= S[el]
-        F[el] = f
-    return F, S
-
-
-def ls_viterbi_naive(h, alleles, G, rho, mu):
-    """
-    Simple matrix based method for LS Viterbi algorithm using Python loops.
-    """
-    assert rho[0] == 0
-    m, n = G.shape
-    alleles = check_alleles(alleles, m)
-    L = np.ones(n)
-    T = [set() for _ in range(m)]
-    T_dest = np.zeros(m, dtype=int)
-
-    for el in range(m):
-        # The calculation below is undefined otherwise.
-        if len(alleles[el]) > 1:
-            assert mu[el] <= 1 / (len(alleles[el]) - 1)
-        L_next = np.zeros(n)
-        for j in range(n):
-            # NOTE Careful with the difference between this expression and
-            # the Forward algorithm above. This depends on the different
-            # normalisation approach.
-            p_no_recomb = L[j] * (1 - rho[el] + rho[el] / n)
-            p_recomb = rho[el] / n
-            if p_no_recomb > p_recomb:
-                p_t = p_no_recomb
-            else:
-                p_t = p_recomb
-                T[el].add(j)
-            p_e = mu[el]
-            if G[el, j] == h[el] or h[el] == tskit.MISSING_DATA:
-                p_e = 1 - (len(alleles[el]) - 1) * mu[el]
-            L_next[j] = p_t * p_e
-        L = L_next
-        j = np.argmax(L)
-        T_dest[el] = j
-        if L[j] == 0:
-            assert mu[el] == 0
-            raise ValueError(
-                "Trying to match non-existent allele with zero mutation rate"
-            )
-        L /= L[j]
-
-    P = np.zeros(m, dtype=int)
-    P[m - 1] = T_dest[m - 1]
-    for el in range(m - 1, 0, -1):
-        j = P[el]
-        if j in T[el]:
-            j = T_dest[el - 1]
-        P[el - 1] = j
-    return P
-
-
-def ls_viterbi_vectorised(h, alleles, G, rho, mu):
-    # We must have a non-zero mutation rate, or we'll end up with
-    # division by zero problems.
-    # assert np.all(mu > 0)
-
-    m, n = G.shape
-    alleles = check_alleles(alleles, m)
-    V = np.ones(n)
-    T = [None for _ in range(m)]
-    max_index = np.zeros(m, dtype=int)
-
-    for site in range(m):
-        # Transition
-        p_neq = rho[site] / n
-        p_t = (1 - rho[site] + rho[site] / n) * V
-        recombinations = np.where(p_neq > p_t)[0]
-        p_t[recombinations] = p_neq
-        T[site] = recombinations
-        # Emission
-        p_e = np.zeros(n) + mu[site]
-        index = G[site] == h[site]
-        if h[site] == tskit.MISSING_DATA:
-            # Missing data is considered equal to everything
-            index[:] = True
-        p_e[index] = 1 - (len(alleles[site]) - 1) * mu[site]
-        V = p_t * p_e
-        # Normalise
-        max_index[site] = np.argmax(V)
-        # print(site, ":", V)
-        if V[max_index[site]] == 0:
-            assert mu[site] == 0
-            raise ValueError(
-                "Trying to match non-existent allele with zero mutation rate"
-            )
-        V /= V[max_index[site]]
-
-    # Traceback
-    P = np.zeros(m, dtype=int)
-    site = m - 1
-    P[site] = max_index[site]
-    while site > 0:
-        j = P[site]
-        if in_sorted(T[site], j):
-            j = max_index[site - 1]
-        P[site - 1] = j
-        site -= 1
-    return P
-
-
-def check_alleles(alleles, num_sites):
+def check_alleles(alleles, m):
     """
     Checks the specified allele list and returns a list of lists
     of alleles of length num_sites.
-
     If alleles is a 1D list of strings, assume that this list is used
     for each site and return num_sites copies of this list.
-
     Otherwise, raise a ValueError if alleles is not a list of length
     num_sites.
     """
     if isinstance(alleles[0], str):
-        return [alleles for _ in range(num_sites)]
-    if len(alleles) != num_sites:
+        return [alleles for _ in range(m)], np.int8([len(alleles) for _ in range(m)])
+    if len(alleles) != m:
         raise ValueError("Malformed alleles list")
-    return alleles
+    n_alleles = np.int8([(len(alleles_site)) for alleles_site in alleles])
+    return alleles, n_alleles
 
 
-def ls_forward_matrix(h, alleles, G, rho, mu):
+def mirror_coordinates(ts):
     """
-    Simple matrix based method for LS forward algorithm using numpy vectorisation.
+    Returns a copy of the specified tree sequence in which all
+    coordinates x are transformed into L - x.
     """
-    assert rho[0] == 0
-    m, n = G.shape
-    alleles = check_alleles(alleles, m)
-    F = np.zeros((m, n))
-    S = np.zeros(m)
-    f = np.zeros(n) + 1 / n
-    p_e = np.zeros(n)
-
-    for el in range(0, m):
-        p_t = f * (1 - rho[el]) + rho[el] / n
-        eq = G[el] == h[el]
-        if h[el] == tskit.MISSING_DATA:
-            # Missing data is equal to everything
-            eq[:] = True
-        p_e[:] = mu[el]
-        p_e[eq] = 1 - (len(alleles[el]) - 1) * mu[el]
-        f = p_t * p_e
-        S[el] = np.sum(f)
-        # TODO need to handle the 0 case.
-        assert S[el] > 0
-        f /= S[el]
-        F[el] = f
-    return F, S
-
-
-def forward_matrix_log_proba(F, S):
-    """
-    Given the specified forward matrix and scaling factor array, return the
-    overall log probability of the input haplotype.
-    """
-    return np.sum(np.log(S)) - np.log(np.sum(F[-1]))
-
-
-def ls_forward_matrix_unscaled(h, alleles, G, rho, mu):
-    """
-    Simple matrix based method for LS forward algorithm.
-    """
-    assert rho[0] == 0
-    m, n = G.shape
-    alleles = check_alleles(alleles, m)
-    F = np.zeros((m, n))
-    f = np.zeros(n) + 1 / n
-
-    for el in range(0, m):
-        s = np.sum(f)
-        for j in range(n):
-            p_t = f[j] * (1 - rho[el]) + s * rho[el] / n
-            p_e = mu[el]
-            if G[el, j] == h[el] or h[el] == tskit.MISSING_DATA:
-                p_e = 1 - (len(alleles[el]) - 1) * mu[el]
-            f[j] = p_t * p_e
-        F[el] = f
-    return F
-
-
-# TODO change this to use the log_proba function below.
-def ls_path_probability(h, path, G, rho, mu):
-    """
-    Returns the probability of the specified path through the genotypes for the
-    specified haplotype.
-    """
-    # Assuming num_alleles = 2
-    assert rho[0] == 0
-    m, n = G.shape
-    # TODO It's not entirely clear why we're starting with a proba of 1 / n for the
-    # model. This was done because it made it easier to compare with an existing
-    # HMM implementation. Need to figure this one out when writing up.
-    proba = 1 / n
-    for site in range(0, m):
-        pe = mu[site]
-        if h[site] == G[site, path[site]] or h[site] == tskit.MISSING_DATA:
-            pe = 1 - mu[site]
-        pt = rho[site] / n
-        if site == 0 or path[site] == path[site - 1]:
-            pt = 1 - rho[site] + rho[site] / n
-        proba *= pt * pe
-    return proba
-
-
-def ls_path_log_probability(h, path, alleles, G, rho, mu):
-    """
-    Returns the log probability of the specified path through the genotypes for the
-    specified haplotype.
-    """
-    assert rho[0] == 0
-    m, n = G.shape
-    alleles = check_alleles(alleles, m)
-    # TODO It's not entirely clear why we're starting with a proba of 1 / n for the
-    # model. This was done because it made it easier to compare with an existing
-    # HMM implementation. Need to figure this one out when writing up.
-    log_proba = np.log(1 / n)
-    for site in range(0, m):
-        if len(alleles[site]) > 1:
-            assert mu[site] <= 1 / (len(alleles[site]) - 1)
-        pe = mu[site]
-        if h[site] == G[site, path[site]] or h[site] == tskit.MISSING_DATA:
-            pe = 1 - (len(alleles[site]) - 1) * mu[site]
-        assert 0 <= pe <= 1
-        pt = rho[site] / n
-        if site == 0 or path[site] == path[site - 1]:
-            pt = 1 - rho[site] + rho[site] / n
-        assert 0 <= pt <= 1
-        log_proba += np.log(pt) + np.log(pe)
-    return log_proba
-
-
-def ls_forward_tree(h, alleles, ts, rho, mu, precision=30, use_lib=True):
-    """
-    Forward matrix computation based on a tree sequence.
-    """
-    if use_lib:
-        acgt_alleles = tuple(alleles) == tskit.ALLELES_ACGT
-        ls_hmm = _tskit.LsHmm(
-            ts.ll_tree_sequence,
-            recombination_rate=rho,
-            mutation_rate=mu,
-            precision=precision,
-            acgt_alleles=acgt_alleles,
-        )
-        cm = _tskit.CompressedMatrix(ts.ll_tree_sequence)
-        ls_hmm.forward_matrix(h, cm)
-        return cm
-    else:
-        fa = ForwardAlgorithm(ts, rho, mu, alleles, precision=precision)
-        return fa.run(h)
-
-
-def ls_viterbi_tree(h, alleles, ts, rho, mu, precision=30, use_lib=True):
-    """
-    Viterbi path computation based on a tree sequence.
-    """
-    if use_lib:
-        acgt_alleles = tuple(alleles) == tskit.ALLELES_ACGT
-        ls_hmm = _tskit.LsHmm(
-            ts.ll_tree_sequence,
-            recombination_rate=rho,
-            mutation_rate=mu,
-            precision=precision,
-            acgt_alleles=acgt_alleles,
-        )
-        vm = _tskit.ViterbiMatrix(ts.ll_tree_sequence)
-        ls_hmm.viterbi_matrix(h, vm)
-        return vm
-    else:
-        va = ViterbiAlgorithm(ts, rho, mu, alleles, precision=precision)
-        return va.run(h)
+    L = ts.sequence_length
+    tables = ts.dump_tables()
+    left = tables.edges.left
+    right = tables.edges.right
+    tables.edges.left = L - right
+    tables.edges.right = L - left
+    tables.sites.position = L - tables.sites.position  # + 1
+    # TODO migrations.
+    tables.sort()
+    return tables.tree_sequence()
 
 
 class ValueTransition:
-    """
-    Simple struct holding value transition values.
-    """
+    """Simple struct holding value transition values."""
 
     def __init__(self, tree_node=-1, value=-1, value_index=-1):
         self.tree_node = tree_node
@@ -353,7 +80,11 @@ class ValueTransition:
         self.value_index = value_index
 
     def copy(self):
-        return ValueTransition(self.tree_node, self.value, self.value_index)
+        return ValueTransition(
+            self.tree_node,
+            self.value,
+            self.value_index,
+        )
 
     def __repr__(self):
         return repr(self.__dict__)
@@ -367,11 +98,12 @@ class LsHmmAlgorithm:
     Abstract superclass of Li and Stephens HMM algorithm.
     """
 
-    def __init__(self, ts, rho, mu, alleles, precision=10):
+    def __init__(
+        self, ts, rho, mu, alleles, n_alleles, precision=10, scale_mutation=False
+    ):
         self.ts = ts
         self.mu = mu
         self.rho = rho
-        self.alleles = check_alleles(alleles, ts.num_sites)
         self.precision = precision
         # The array of ValueTransitions.
         self.T = []
@@ -381,11 +113,15 @@ class LsHmmAlgorithm:
         self.N = np.zeros(ts.num_nodes, dtype=int)
         # Efficiently compute the allelic state at a site
         self.allelic_state = np.zeros(ts.num_nodes, dtype=int) - 1
-        # Diffs so we can can update T and T_index between trees.
-        self.edge_diffs = self.ts.edge_diffs()
+        # TreePosition so we can can update T and T_index between trees.
+        self.tree_pos = tsutil.TreePosition(ts)
         self.parent = np.zeros(self.ts.num_nodes, dtype=int) - 1
         self.tree = tskit.Tree(self.ts)
         self.output = None
+        # Vector of the number of alleles at each site
+        self.n_alleles = n_alleles
+        self.alleles = alleles
+        self.scale_mutation_based_on_n_alleles = scale_mutation
 
     def check_integrity(self):
         M = [st.tree_node for st in self.T if st.tree_node != -1]
@@ -422,10 +158,6 @@ class LsHmmAlgorithm:
                 for j in range(num_values):
                     value_count[j] += child[j]
             max_value_count = np.max(value_count)
-            # NOTE: we need to set the set to zero here because we actually
-            # visit some nodes more than once during the postorder traversal.
-            # This would seem to be wasteful, so we should revisit this when
-            # cleaning up the algorithm logic.
             optimal_set[u, :] = 0
             optimal_set[u, value_count == max_value_count] = 1
 
@@ -501,16 +233,24 @@ class LsHmmAlgorithm:
             if T_parent[j] != -1:
                 self.N[T_parent[j]] -= self.N[j]
 
-    def update_tree(self):
+    def update_tree(self, direction=tskit.FORWARD):
         """
         Update the internal data structures to move on to the next tree.
         """
         parent = self.parent
         T_index = self.T_index
         T = self.T
-        _, edges_out, edges_in = next(self.edge_diffs)
+        if direction == tskit.FORWARD:
+            self.tree_pos.next()
+        else:
+            self.tree_pos.prev()
+        assert self.tree_pos.index == self.tree.index
 
-        for edge in edges_out:
+        for j in range(
+            self.tree_pos.out_range.start, self.tree_pos.out_range.stop, direction
+        ):
+            e = self.tree_pos.out_range.order[j]
+            edge = self.ts.edge(e)
             u = edge.child
             if T_index[u] == -1:
                 # Make sure the subtree we're detaching has an T_index-value at the root.
@@ -523,7 +263,11 @@ class LsHmmAlgorithm:
                 )
             parent[edge.child] = -1
 
-        for edge in edges_in:
+        for j in range(
+            self.tree_pos.in_range.start, self.tree_pos.in_range.stop, direction
+        ):
+            e = self.tree_pos.in_range.order[j]
+            edge = self.ts.edge(e)
             parent[edge.child] = edge.parent
             u = edge.parent
             if parent[edge.parent] == -1:
@@ -566,9 +310,9 @@ class LsHmmAlgorithm:
         T = self.T
         alleles = self.alleles[site.id]
         allelic_state = self.allelic_state
-
         # Set the allelic_state for this site.
         allelic_state[tree.root] = alleles.index(site.ancestral_state)
+
         for mutation in site.mutations:
             u = mutation.node
             allelic_state[u] = alleles.index(mutation.derived_state)
@@ -590,9 +334,9 @@ class LsHmmAlgorithm:
                     v = tree.parent(v)
                     assert v != -1
                 match = (
-                    haplotype_state == tskit.MISSING_DATA
-                    or haplotype_state == allelic_state[v]
+                    haplotype_state == MISSING or haplotype_state == allelic_state[v]
                 )
+                # Note that the node u is used only by Viterbi
                 st.value = self.compute_next_probability(site.id, st.value, match, u)
 
         # Unset the states
@@ -601,33 +345,56 @@ class LsHmmAlgorithm:
             allelic_state[mutation.node] = -1
 
     def process_site(self, site, haplotype_state):
-        # print(site.id, "num_transitions=", len(self.T))
         self.update_probabilities(site, haplotype_state)
-        # FIXME We don't want to call compress here.
-        # What we really want to do is just call compress after
-        # the values have been normalised and rounded. However, we can't
-        # compute the normalisation factor in the forwards algorithm without
-        # the N counts (number of samples directly below each value transition
-        # in T), and these are currently computed during compress. So to make
-        # things work for now we call compress before and put up with having
-        # a slightly less than optimally compressed output matrix. It might
-        # end up that this makes no difference and compressing the
-        # pre-rounded values is basically the same thing.
         self.compress()
         s = self.compute_normalisation_factor()
         for st in self.T:
-            if st.tree_node != tskit.NULL:
-                st.value /= s
-                st.value = round(st.value, self.precision)
-        # *This* is where we want to compress (and can, for viterbi).
-        # self.compress()
+            assert st.tree_node != tskit.NULL
+            # if st.tree_node != tskit.NULL:
+            st.value /= s
+            st.value = round(st.value, self.precision)
         self.output.store_site(site.id, s, [(st.tree_node, st.value) for st in self.T])
+
+    def compute_emission_proba(self, site_id, is_match):
+        mu = self.mu[site_id]
+        n_alleles = self.n_alleles[site_id]
+        if self.scale_mutation_based_on_n_alleles:
+            if is_match:
+                # Scale mutation based on the number of alleles
+                # - so the mutation rate is the mutation rate to one of the
+                # alleles. The overall mutation rate is then
+                # (n_alleles - 1) * mutation_rate.
+                p_e = 1 - (n_alleles - 1) * mu
+            else:
+                p_e = mu - mu * (n_alleles == 1)
+                # Added boolean in case we're at an invariant site
+        else:
+            # No scaling based on the number of alleles
+            #  - so the mutation rate is the mutation rate to anything.
+            # This means that we must rescale the mutation rate to a different
+            # allele, by the number of alleles.
+            if n_alleles == 1:  # In case we're at an invariant site
+                if is_match:
+                    p_e = 1
+                else:
+                    p_e = 0
+            else:
+                if is_match:
+                    p_e = 1 - mu
+                else:
+                    p_e = mu / (n_alleles - 1)
+        return p_e
+
+    def initialise(self, value):
+        self.tree.clear()
+        for u in self.ts.samples():
+            j = len(self.T)
+            self.T_index[u] = j
+            self.T.append(ValueTransition(tree_node=u, value=value))
 
     def run(self, h):
         n = self.ts.num_samples
-        for u in self.ts.samples():
-            self.T_index[u] = len(self.T)
-            self.T.append(ValueTransition(tree_node=u, value=1 / n))
+        self.initialise(1 / n)
         while self.tree.next():
             self.update_tree()
             for site in self.tree.sites():
@@ -639,6 +406,147 @@ class LsHmmAlgorithm:
 
     def compute_next_probability(self, site_id, p_last, is_match, node):
         raise NotImplementedError()
+
+
+class ForwardAlgorithm(LsHmmAlgorithm):
+    """
+    The Li and Stephens forward algorithm.
+    """
+
+    def __init__(
+        self, ts, rho, mu, alleles, n_alleles, scale_mutation=False, precision=10
+    ):
+        super().__init__(
+            ts,
+            rho,
+            mu,
+            alleles,
+            n_alleles,
+            precision=precision,
+            scale_mutation=scale_mutation,
+        )
+        self.output = CompressedMatrix(ts)
+
+    def compute_normalisation_factor(self):
+        s = 0
+        for j, st in enumerate(self.T):
+            assert st.tree_node != tskit.NULL
+            # assert self.N[j] > 0
+            s += self.N[j] * st.value
+        return s
+
+    def compute_next_probability(self, site_id, p_last, is_match, node):
+        rho = self.rho[site_id]
+        n = self.ts.num_samples
+        p_e = self.compute_emission_proba(site_id, is_match)
+        p_t = p_last * (1 - rho) + rho / n
+        return p_t * p_e
+
+
+class BackwardAlgorithm(ForwardAlgorithm):
+    """
+    The Li and Stephens backward algorithm.
+    """
+
+    def compute_next_probability(self, site_id, p_next, is_match, node):
+        p_e = self.compute_emission_proba(site_id, is_match)
+        return p_next * p_e
+
+    def process_site(self, site, haplotype_state, s):
+        # FIXME see nodes in the C code for why we have two calls to
+        # compress
+        # https://github.com/tskit-dev/tskit/issues/2803
+        self.compress()
+        self.output.store_site(
+            site.id,
+            s,
+            [(st.tree_node, st.value) for st in self.T],
+        )
+        self.update_probabilities(site, haplotype_state)
+        # FIXME see nodes in the C code for why we have two calls to
+        # compress
+        self.compress()
+        b_last_sum = self.compute_normalisation_factor()
+        n = self.ts.num_samples
+        rho = self.rho[site.id]
+        for st in self.T:
+            if st.tree_node != tskit.NULL:
+                st.value = rho * b_last_sum / n + (1 - rho) * st.value
+                st.value /= s
+                st.value = round(st.value, self.precision)
+
+    def run(self, h, normalisation_factor):
+        self.initialise(value=1)
+        while self.tree.prev():
+            self.update_tree(direction=tskit.REVERSE)
+            for site in reversed(list(self.tree.sites())):
+                self.process_site(site, h[site.id], normalisation_factor[site.id])
+        return self.output
+
+
+class ViterbiAlgorithm(LsHmmAlgorithm):
+    """
+    Runs the Li and Stephens Viterbi algorithm.
+    """
+
+    def __init__(
+        self, ts, rho, mu, alleles, n_alleles, scale_mutation=False, precision=10
+    ):
+        super().__init__(
+            ts,
+            rho,
+            mu,
+            alleles,
+            n_alleles,
+            precision=precision,
+            scale_mutation=scale_mutation,
+        )
+        self.output = ViterbiMatrix(ts)
+
+    def compute_normalisation_factor(self):
+        max_st = ValueTransition(value=-1)
+        for st in self.T:
+            assert st.tree_node != tskit.NULL
+            if st.value > max_st.value:
+                max_st = st
+        if max_st.value == 0:
+            raise ValueError(
+                "Trying to match non-existent allele with zero mutation rate"
+            )
+        return max_st.value
+
+    def compute_next_probability(self, site_id, p_last, is_match, node):
+        rho = self.rho[site_id]
+        n = self.ts.num_samples
+
+        p_no_recomb = p_last * (1 - rho + rho / n)
+        p_recomb = rho / n
+        recombination_required = False
+        if p_no_recomb > p_recomb:
+            p_t = p_no_recomb
+        else:
+            p_t = p_recomb
+            recombination_required = True
+        self.output.add_recombination_required(site_id, node, recombination_required)
+
+        p_e = self.compute_emission_proba(site_id, is_match)
+        return p_t * p_e
+
+
+def assert_compressed_matrices_equal(cm1, cm2):
+    nt.assert_array_almost_equal(cm1.normalisation_factor, cm2.normalisation_factor)
+
+    for j in range(cm1.num_sites):
+        site1 = cm1.get_site(j)
+        site2 = cm2.get_site(j)
+        assert len(site1) == len(site2)
+        site1 = dict(site1)
+        site2 = dict(site2)
+
+        assert set(site1.keys()) == set(site2.keys())
+        for node in site1.keys():
+            # TODO  the precision value should be used as a parameter here
+            nt.assert_allclose(site1[node], site2[node], rtol=1e-5, atol=1e-8)
 
 
 class CompressedMatrix:
@@ -658,6 +566,7 @@ class CompressedMatrix:
         self.normalisation_factor = np.zeros(self.num_sites)
 
     def store_site(self, site, normalisation_factor, value_transitions):
+        assert all(u >= 0 for u, _ in value_transitions)
         self.normalisation_factor[site] = normalisation_factor
         self.value_transitions[site] = value_transitions
 
@@ -676,51 +585,16 @@ class CompressedMatrix:
         Decodes the tree encoding of the values into an explicit
         matrix.
         """
+        sample_index_map = np.zeros(self.ts.num_nodes, dtype=int) - 1
+        sample_index_map[self.ts.samples()] = np.arange(self.ts.num_samples)
         A = np.zeros((self.num_sites, self.num_samples))
         for tree in self.ts.trees():
             for site in tree.sites():
-                f = dict(self.value_transitions[site.id])
-                for j, u in enumerate(self.ts.samples()):
-                    while u not in f:
-                        u = tree.parent(u)
-                    A[site.id, j] = f[u]
+                for node, value in self.value_transitions[site.id]:
+                    for u in tree.samples(node):
+                        j = sample_index_map[u]
+                        A[site.id, j] = value
         return A
-
-
-class ForwardMatrix(CompressedMatrix):
-    """
-    Class representing a compressed forward matrix.
-    """
-
-
-class ForwardAlgorithm(LsHmmAlgorithm):
-    """
-    Runs the Li and Stephens forward algorithm.
-    """
-
-    def __init__(self, ts, rho, mu, alleles, precision=10):
-        super().__init__(ts, rho, mu, alleles, precision)
-        self.output = ForwardMatrix(ts)
-
-    def compute_normalisation_factor(self):
-        s = 0
-        for j, st in enumerate(self.T):
-            assert st.tree_node != tskit.NULL
-            assert self.N[j] > 0
-            s += self.N[j] * st.value
-        return s
-
-    def compute_next_probability(self, site_id, p_last, is_match, node):
-        rho = self.rho[site_id]
-        mu = self.mu[site_id]
-        alleles = self.alleles[site_id]
-        n = self.ts.num_samples
-
-        p_t = p_last * (1 - rho) + rho / n
-        p_e = mu
-        if is_match:
-            p_e = 1 - (len(alleles) - 1) * mu
-        return p_t * p_e
 
 
 class ViterbiMatrix(CompressedMatrix):
@@ -730,6 +604,8 @@ class ViterbiMatrix(CompressedMatrix):
 
     def __init__(self, ts):
         super().__init__(ts)
+        # Tuple containing the site, the node in the tree, and whether
+        # recombination is required
         self.recombination_required = [(-1, 0, False)]
 
     def add_recombination_required(self, site, node, required):
@@ -801,510 +677,607 @@ class ViterbiMatrix(CompressedMatrix):
         return match
 
 
-class ViterbiAlgorithm(LsHmmAlgorithm):
-    """
-    Runs the Li and Stephens Viterbi algorithm.
-    """
-
-    def __init__(self, ts, rho, mu, alleles, precision=10):
-        super().__init__(ts, rho, mu, alleles, precision)
-        self.output = ViterbiMatrix(ts)
-
-    def compute_normalisation_factor(self):
-        max_st = ValueTransition(value=-1)
-        for st in self.T:
-            assert st.tree_node != tskit.NULL
-            if st.value > max_st.value:
-                max_st = st
-        if max_st.value == 0:
-            raise ValueError(
-                "Trying to match non-existent allele with zero mutation rate"
-            )
-        return max_st.value
-
-    def compute_next_probability(self, site_id, p_last, is_match, node):
-        rho = self.rho[site_id]
-        mu = self.mu[site_id]
-        alleles = self.alleles[site_id]
-        n = self.ts.num_samples
-
-        p_no_recomb = p_last * (1 - rho + rho / n)
-        p_recomb = rho / n
-        recombination_required = False
-        if p_no_recomb > p_recomb:
-            p_t = p_no_recomb
-        else:
-            p_t = p_recomb
-            recombination_required = True
-        self.output.add_recombination_required(site_id, node, recombination_required)
-        p_e = mu
-        if is_match:
-            p_e = 1 - (len(alleles) - 1) * mu
-        return p_t * p_e
+def get_site_alleles(ts, h, alleles):
+    if alleles is None:
+        n_alleles = np.int8(
+            [
+                len(np.unique(np.append(ts.genotype_matrix()[j, :], h[j])))
+                for j in range(ts.num_sites)
+            ]
+        )
+        alleles = tskit.ALLELES_ACGT
+        if len(set(alleles).intersection(next(ts.variants()).alleles)) == 0:
+            alleles = tskit.ALLELES_01
+            if len(set(alleles).intersection(next(ts.variants()).alleles)) == 0:
+                raise ValueError(
+                    """Alleles list could not be identified.
+                    Please pass a list of lists of alleles of length m,
+                    or a list of alleles (e.g. tskit.ALLELES_ACGT)"""
+                )
+        alleles = [alleles for _ in range(ts.num_sites)]
+    else:
+        alleles, n_alleles = check_alleles(alleles, ts.num_sites)
+    return alleles, n_alleles
 
 
-################################################################
-# Tests
-################################################################
+def ls_forward_tree(
+    h, ts, rho, mu, precision=30, alleles=None, scale_mutation_based_on_n_alleles=False
+):
+    alleles, n_alleles = get_site_alleles(ts, h, alleles)
+    fa = ForwardAlgorithm(
+        ts,
+        rho,
+        mu,
+        alleles,
+        n_alleles,
+        precision=precision,
+        scale_mutation=scale_mutation_based_on_n_alleles,
+    )
+    return fa.run(h)
 
 
-class LiStephensBase:
-    """
-    Superclass of Li and Stephens tests.
-    """
+def ls_backward_tree(h, ts, rho, mu, normalisation_factor, precision=30, alleles=None):
+    alleles, n_alleles = get_site_alleles(ts, h, alleles)
+    ba = BackwardAlgorithm(
+        ts,
+        rho,
+        mu,
+        alleles,
+        n_alleles,
+        precision=precision,
+    )
+    return ba.run(h, normalisation_factor)
 
-    def assertCompressedMatricesEqual(self, cm1, cm2):
-        """
-        Checks that the specified compressed matrices contain the same data.
-        """
-        A1 = cm1.decode()
-        A2 = cm2.decode()
-        assert np.allclose(A1, A2)
-        assert A1.shape == A2.shape
-        assert cm1.num_sites == cm2.num_sites
-        nf1 = cm1.normalisation_factor
-        nf2 = cm1.normalisation_factor
-        assert np.allclose(nf1, nf2)
-        assert nf1.shape == nf2.shape
-        # It seems that we can't rely on the number of transitions in the two
-        # implementations being equal, which seems odd given that we should
-        # be doing things identically. Still, once the decoded matrices are the
-        # same then it seems highly likely to be correct.
 
-        # if not np.array_equal(cm1.num_transitions, cm2.num_transitions):
-        #     print()
-        #     print(cm1.num_transitions)
-        #     print(cm2.num_transitions)
-        # self.assertTrue(np.array_equal(cm1.num_transitions, cm2.num_transitions))
-        # for j in range(cm1.num_sites):
-        #     s1 = dict(cm1.get_site(j))
-        #     s2 = dict(cm2.get_site(j))
-        #     self.assertEqual(set(s1.keys()), set(s2.keys()))
-        #     for key in s1.keys():
-        #         self.assertAlmostEqual(s1[key], s2[key])
+def ls_viterbi_tree(
+    h, ts, rho, mu, precision=30, alleles=None, scale_mutation_based_on_n_alleles=False
+):
+    alleles, n_alleles = get_site_alleles(ts, h, alleles)
+    va = ViterbiAlgorithm(
+        ts,
+        rho,
+        mu,
+        alleles,
+        n_alleles,
+        precision=precision,
+        scale_mutation=scale_mutation_based_on_n_alleles,
+    )
+    return va.run(h)
 
-    def example_haplotypes(self, ts, alleles, num_random=10, seed=2):
-        rng = np.random.RandomState(seed)
-        H = ts.genotype_matrix(alleles=alleles).T
-        haplotypes = [H[0], H[-1]]
-        for _ in range(num_random):
-            # Choose a random path through H
-            p = rng.randint(0, ts.num_samples, ts.num_sites)
-            h = H[p, np.arange(ts.num_sites)]
-            haplotypes.append(h)
-        h = H[0].copy()
-        h[-1] = tskit.MISSING_DATA
-        haplotypes.append(h)
-        h = H[0].copy()
-        h[ts.num_sites // 2] = tskit.MISSING_DATA
-        haplotypes.append(h)
-        # All missing is OK tool
-        h = H[0].copy()
-        h[:] = tskit.MISSING_DATA
-        haplotypes.append(h)
-        return haplotypes
 
-    def example_parameters(self, ts, alleles, seed=1):
-        """
-        Returns an iterator over combinations of haplotype, recombination and mutation
-        rates.
-        """
-        rng = np.random.RandomState(seed)
-        haplotypes = self.example_haplotypes(ts, alleles, seed=seed)
+class LSBase:
+    """Superclass of Li and Stephens tests."""
 
-        # This is the exact matching limit.
-        rho = np.zeros(ts.num_sites) + 0.01
-        mu = np.zeros(ts.num_sites)
-        rho[0] = 0
-        for h in haplotypes:
-            yield h, rho, mu
+    def example_haplotypes(self, ts):
+        H = ts.genotype_matrix()
+        s = H[:, 0].reshape(1, H.shape[0])
+        H = H[:, 1:]
+
+        haplotypes = [
+            s,
+            H[:, -1].reshape(1, H.shape[0]),
+        ]
+        s_tmp = s.copy()
+        s_tmp[0, -1] = MISSING
+        haplotypes.append(s_tmp)
+        s_tmp = s.copy()
+        s_tmp[0, ts.num_sites // 2] = MISSING
+        haplotypes.append(s_tmp)
+        s_tmp = s.copy()
+        s_tmp[0, :] = MISSING
+        haplotypes.append(s_tmp)
+
+        return H, haplotypes
+
+    def example_parameters_haplotypes(self, ts, seed=42):
+        """Returns an iterator over combinations of haplotype,
+        recombination and mutation rates."""
+        np.random.seed(seed)
+        H, haplotypes = self.example_haplotypes(ts)
+        n = H.shape[1]
+        m = ts.get_num_sites()
 
         # Here we have equal mutation and recombination
-        rho = np.zeros(ts.num_sites) + 0.01
-        mu = np.zeros(ts.num_sites) + 0.01
-        rho[0] = 0
-        for h in haplotypes:
-            yield h, rho, mu
+        r = np.zeros(m) + 0.01
+        mu = np.zeros(m) + 0.01
+        r[0] = 0
 
-        # Mixture of random and extremes
-        rhos = [
-            np.zeros(ts.num_sites) + 0.999,
-            np.zeros(ts.num_sites) + 1e-6,
-            rng.uniform(0, 1, ts.num_sites),
-        ]
-        # mu can't be more than 1 / 3 if we have 4 alleles
-        mus = [
-            np.zeros(ts.num_sites) + 0.33,
-            np.zeros(ts.num_sites) + 1e-6,
-            rng.uniform(0, 0.33, ts.num_sites),
-        ]
-        for h, rho, mu in itertools.product(haplotypes, rhos, mus):
-            rho[0] = 0
-            yield h, rho, mu
+        for s in haplotypes:
+            yield n, H, s, r, mu
+
+        # FIXME removing these as tests are abominably slow.
+        # We'll be refactoring all this to use pytest anyway, so let's not
+        # worry too much about coverage for now.
+        # # Mixture of random and extremes
+        # rs = [np.zeros(m) + 0.999, np.zeros(m) + 1e-6, np.random.rand(m)]
+        # mus = [np.zeros(m) + 0.33, np.zeros(m) + 1e-6, np.random.rand(m) * 0.33]
+
+        # import itertools
+        # for s, r, mu in itertools.product(haplotypes, rs, mus):
+        #     r[0] = 0
+        #     yield n, H, s, r, mu
 
     def assertAllClose(self, A, B):
-        assert np.allclose(A, B)
+        """Assert that all entries of two matrices are 'close'"""
+        assert np.allclose(A, B, rtol=1e-5, atol=1e-8)
 
-    def test_simple_n_4_no_recombination(self):
-        ts = msprime.simulate(4, recombination_rate=0, mutation_rate=0.5, random_seed=1)
+    # Define a bunch of very small tree-sequences for testing a collection
+    # of parameters on
+    def test_simple_n_10_no_recombination(self):
+        ts = msprime.simulate(
+            10, recombination_rate=0, mutation_rate=0.5, random_seed=42
+        )
         assert ts.num_sites > 3
         self.verify(ts)
 
-    def test_simple_n_3(self):
-        ts = msprime.simulate(3, recombination_rate=2, mutation_rate=7, random_seed=2)
+    def test_simple_n_10_no_recombination_high_mut(self):
+        ts = msprime.simulate(10, recombination_rate=0, mutation_rate=3, random_seed=42)
+        assert ts.num_sites > 3
+        self.verify(ts)
+
+    def test_simple_n_10_no_recombination_higher_mut(self):
+        ts = msprime.simulate(20, recombination_rate=0, mutation_rate=3, random_seed=42)
+        assert ts.num_sites > 3
+        self.verify(ts)
+
+    def test_simple_n_6(self):
+        ts = msprime.simulate(6, recombination_rate=2, mutation_rate=7, random_seed=42)
         assert ts.num_sites > 5
         self.verify(ts)
 
-    def test_simple_n_7(self):
-        ts = msprime.simulate(7, recombination_rate=2, mutation_rate=5, random_seed=2)
+    def test_simple_n_8(self):
+        ts = msprime.simulate(8, recombination_rate=2, mutation_rate=5, random_seed=42)
         assert ts.num_sites > 5
         self.verify(ts)
 
     def test_simple_n_8_high_recombination(self):
-        ts = msprime.simulate(8, recombination_rate=20, mutation_rate=5, random_seed=2)
+        ts = msprime.simulate(8, recombination_rate=20, mutation_rate=5, random_seed=42)
         assert ts.num_trees > 15
         assert ts.num_sites > 5
         self.verify(ts)
 
-    def test_simple_n_15(self):
-        ts = msprime.simulate(15, recombination_rate=2, mutation_rate=5, random_seed=2)
+    def test_simple_n_16(self):
+        ts = msprime.simulate(16, recombination_rate=2, mutation_rate=5, random_seed=42)
         assert ts.num_sites > 5
         self.verify(ts)
 
-    def test_jukes_cantor_n_3(self):
-        ts = msprime.simulate(3, mutation_rate=2, random_seed=2)
-        ts = tsutil.jukes_cantor(ts, num_sites=10, mu=10, seed=4)
-        self.verify(ts, tskit.ALLELES_ACGT)
+    # # Define a bunch of very small tree-sequences for testing a collection
+    # # of parameters on
+    # def test_simple_n_10_no_recombination_blah(self):
+    #     ts = msprime.sim_ancestry(
+    #         samples=10,
+    #         recombination_rate=0,
+    #         random_seed=42,
+    #         sequence_length=10,
+    #         population_size=10000,
+    #     )
+    #     ts = msprime.sim_mutations(ts, rate=1e-5, random_seed=42)
+    #     assert ts.num_sites > 3
+    #     self.verify(ts)
 
-    def test_jukes_cantor_n_8_high_recombination(self):
-        ts = msprime.simulate(8, recombination_rate=20, random_seed=2)
-        ts = tsutil.jukes_cantor(ts, num_sites=20, mu=5, seed=4)
-        self.verify(ts, tskit.ALLELES_ACGT)
+    # def test_simple_n_6_blah(self):
+    # ts = msprime.sim_ancestry(
+    #     samples=6,
+    #     recombination_rate=1e-4,
+    #     random_seed=42,
+    #     sequence_length=40,
+    #     population_size=10000,
+    # )
+    # ts = msprime.sim_mutations(ts, rate=1e-3, random_seed=42)
+    #     assert ts.num_sites > 5
+    #     self.verify(ts)
 
-    def test_jukes_cantor_n_15(self):
-        ts = msprime.simulate(15, mutation_rate=2, random_seed=2)
-        ts = tsutil.jukes_cantor(ts, num_sites=10, mu=0.1, seed=10)
-        self.verify(ts, tskit.ALLELES_ACGT)
+    # def test_simple_n_8_blah(self):
+    #     ts = msprime.sim_ancestry(
+    #         samples=8,
+    #         recombination_rate=1e-4,
+    #         random_seed=42,
+    #         sequence_length=20,
+    #         population_size=10000,
+    #     )
+    #     ts = msprime.sim_mutations(ts, rate=1e-4, random_seed=42)
+    #     assert ts.num_sites > 5
+    #     assert ts.num_trees > 15
+    #     self.verify(ts)
 
-    def test_jukes_cantor_balanced_ternary(self):
-        ts = tskit.Tree.generate_balanced(27, arity=3).tree_sequence
-        ts = tsutil.jukes_cantor(ts, num_sites=10, mu=0.1, seed=10)
-        self.verify(ts, tskit.ALLELES_ACGT)
+    # def test_simple_n_16_blah(self):
+    #     ts = msprime.sim_ancestry(
+    #         samples=16,
+    #         recombination_rate=1e-2,
+    #         random_seed=42,
+    #         sequence_length=20,
+    #         population_size=10000,
+    #     )
+    #     ts = msprime.sim_mutations(ts, rate=1e-4, random_seed=42)
+    #     assert ts.num_sites > 5
+    #     self.verify(ts)
 
-    @pytest.mark.skip(reason="Not supporting internal samples yet")
-    def test_ancestors_n_3(self):
-        ts = msprime.simulate(3, recombination_rate=2, mutation_rate=7, random_seed=2)
-        assert ts.num_sites > 5
-        tables = ts.dump_tables()
-        print(tables.nodes)
-        tables.nodes.flags = np.ones_like(tables.nodes.flags)
-        print(tables.nodes)
-        ts = tables.tree_sequence()
-        self.verify(ts)
+    def verify(self, ts):
+        raise NotImplementedError()
 
 
-@pytest.mark.slow
-class ForwardAlgorithmBase(LiStephensBase):
+class FBAlgorithmBase(LSBase):
+    """Base for forwards backwards algorithm tests."""
+
+
+class VitAlgorithmBase(LSBase):
+    """Base for viterbi algoritm tests."""
+
+
+class TestMirroringHap(FBAlgorithmBase):
+    """Tests that mirroring the tree sequence and running forwards and backwards
+    algorithms gives the same log-likelihood of observing the data."""
+
+    def verify(self, ts):
+        for n, H, s, r, mu in self.example_parameters_haplotypes(ts):
+            # Note, need to remove the first sample from the ts, and ensure that
+            # invariant sites aren't removed.
+            ts_check = ts.simplify(range(1, n + 1), filter_sites=False)
+            cm = ls_forward_tree(s[0, :], ts_check, r, mu)
+            ll_tree = np.sum(np.log10(cm.normalisation_factor))
+
+            ts_check_mirror = mirror_coordinates(ts_check)
+            r_flip = np.insert(np.flip(r)[:-1], 0, 0)
+            cm_mirror = ls_forward_tree(
+                np.flip(s[0, :]), ts_check_mirror, r_flip, np.flip(mu)
+            )
+            ll_mirror_tree = np.sum(np.log10(cm_mirror.normalisation_factor))
+            self.assertAllClose(ll_tree, ll_mirror_tree)
+
+            # Ensure that the decoded matrices are the same
+            F_mirror_matrix, c, ll = ls.forwards(
+                np.flip(H, axis=0),
+                np.flip(s, axis=1),
+                r_flip,
+                p_mutation=np.flip(mu),
+                scale_mutation_based_on_n_alleles=False,
+            )
+
+            self.assertAllClose(F_mirror_matrix, cm_mirror.decode())
+            self.assertAllClose(ll, ll_tree)
+
+
+class TestForwardHapTree(FBAlgorithmBase):
+    """Tests that the tree algorithm computes the same forward matrix as the
+    simple method."""
+
+    def verify(self, ts):
+        for n, H, s, r, mu in self.example_parameters_haplotypes(ts):
+            for scale_mutation in [False, True]:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    # Warning from lshmm:
+                    # Passed a vector of mutation rates, but rescaling each mutation
+                    # rate conditional on the number of alleles
+                    F, c, ll = ls.forwards(
+                        H,
+                        s,
+                        r,
+                        p_mutation=mu,
+                        scale_mutation_based_on_n_alleles=scale_mutation,
+                    )
+                # Note, need to remove the first sample from the ts, and ensure
+                # that invariant sites aren't removed.
+                ts_check = ts.simplify(range(1, n + 1), filter_sites=False)
+                cm = ls_forward_tree(
+                    s[0, :],
+                    ts_check,
+                    r,
+                    mu,
+                    scale_mutation_based_on_n_alleles=scale_mutation,
+                )
+                self.assertAllClose(cm.decode(), F)
+                ll_tree = np.sum(np.log10(cm.normalisation_factor))
+                self.assertAllClose(ll, ll_tree)
+
+
+class TestForwardBackwardTree(FBAlgorithmBase):
+    """Tests that the tree algorithm computes the same forward matrix as the
+    simple method."""
+
+    def verify(self, ts):
+        for n, H, s, r, mu in self.example_parameters_haplotypes(ts):
+            F, c, ll = ls.forwards(
+                H, s, r, p_mutation=mu, scale_mutation_based_on_n_alleles=False
+            )
+            B = ls.backwards(
+                H,
+                s,
+                c,
+                r,
+                p_mutation=mu,
+                scale_mutation_based_on_n_alleles=False,
+            )
+
+            # Note, need to remove the first sample from the ts, and ensure that
+            # invariant sites aren't removed.
+            ts_check = ts.simplify(range(1, n + 1), filter_sites=False)
+            c_f = ls_forward_tree(s[0, :], ts_check, r, mu)
+            ll_tree = np.sum(np.log10(c_f.normalisation_factor))
+
+            c_b = ls_backward_tree(
+                s[0, :],
+                ts_check,
+                r,
+                mu,
+                c_f.normalisation_factor,
+            )
+            B_tree = c_b.decode()
+
+            F_tree = c_f.decode()
+
+            self.assertAllClose(B, B_tree)
+            self.assertAllClose(F, F_tree)
+            self.assertAllClose(ll, ll_tree)
+
+
+class TestTreeViterbiHap(VitAlgorithmBase):
+    """Test that we have the same log-likelihood between tree and matrix
+    implementations"""
+
+    def verify(self, ts):
+        for n, H, s, r, mu in self.example_parameters_haplotypes(ts):
+            path, ll = ls.viterbi(
+                H, s, r, p_mutation=mu, scale_mutation_based_on_n_alleles=False
+            )
+            ts_check = ts.simplify(range(1, n + 1), filter_sites=False)
+            cm = ls_viterbi_tree(s[0, :], ts_check, r, mu)
+            ll_tree = np.sum(np.log10(cm.normalisation_factor))
+            self.assertAllClose(ll, ll_tree)
+
+            # Now, need to ensure that the likelihood of the preferred path is
+            # the same as ll_tree (and ll).
+            path_tree = cm.traceback()
+            ll_check = ls.path_ll(
+                H,
+                s,
+                path_tree,
+                r,
+                p_mutation=mu,
+                scale_mutation_based_on_n_alleles=False,
+            )
+            self.assertAllClose(ll, ll_check)
+
+
+# TODO add params to run the various checks
+def check_viterbi(ts, h, recombination=None, mutation=None):
+    h = np.array(h).astype(np.int8)
+    m = ts.num_sites
+    assert len(h) == m
+    if recombination is None:
+        recombination = np.zeros(ts.num_sites) + 1e-9
+    if mutation is None:
+        mutation = np.zeros(ts.num_sites)
+    precision = 22
+
+    G = ts.genotype_matrix()
+
+    path, ll = ls.viterbi(
+        G,
+        h.reshape(1, m),
+        recombination,
+        p_mutation=mutation,
+        scale_mutation_based_on_n_alleles=False,
+    )
+    assert np.isscalar(ll)
+
+    cm = ls_viterbi_tree(h, ts, rho=recombination, mu=mutation)
+    ll_tree = np.sum(np.log10(cm.normalisation_factor))
+    assert np.isscalar(ll_tree)
+    nt.assert_allclose(ll_tree, ll)
+
+    # Check that the likelihood of the preferred path is
+    # the same as ll_tree (and ll).
+    path_tree = cm.traceback()
+    ll_check = ls.path_ll(
+        G,
+        h.reshape(1, m),
+        path_tree,
+        recombination,
+        p_mutation=mutation,
+        scale_mutation_based_on_n_alleles=False,
+    )
+    nt.assert_allclose(ll_check, ll)
+
+    ll_ts = ts._ll_tree_sequence
+    ls_hmm = _tskit.LsHmm(ll_ts, recombination, mutation, precision=precision)
+    cm_lib = _tskit.ViterbiMatrix(ll_ts)
+    ls_hmm.viterbi_matrix(h, cm_lib)
+    path_lib = cm_lib.traceback()
+
+    # Not true in general, but let's see how far it goes
+    nt.assert_array_equal(path_lib, path_tree)
+
+    nt.assert_allclose(cm_lib.normalisation_factor, cm.normalisation_factor)
+
+    return path
+
+
+# TODO add params to run the various checks
+def check_forward_matrix(ts, h, recombination=None, mutation=None):
+    precision = 22
+    h = np.array(h).astype(np.int8)
+    n = ts.num_samples
+    m = ts.num_sites
+    assert len(h) == m
+    if recombination is None:
+        recombination = np.zeros(ts.num_sites) + 1e-9
+    if mutation is None:
+        mutation = np.zeros(ts.num_sites)
+
+    G = ts.genotype_matrix()
+    F, c, ll = ls.forwards(
+        G,
+        h.reshape(1, m),
+        recombination,
+        p_mutation=mutation,
+        scale_mutation_based_on_n_alleles=False,
+    )
+    assert F.shape == (m, n)
+    assert c.shape == (m,)
+    assert np.isscalar(ll)
+
+    cm = ls_forward_tree(
+        h, ts, recombination, mutation, scale_mutation_based_on_n_alleles=False
+    )
+    F2 = cm.decode()
+    nt.assert_allclose(F, F2)
+    nt.assert_allclose(c, cm.normalisation_factor)
+    ll_tree = np.sum(np.log10(cm.normalisation_factor))
+    nt.assert_allclose(ll_tree, ll)
+
+    ll_ts = ts._ll_tree_sequence
+    ls_hmm = _tskit.LsHmm(ll_ts, recombination, mutation, precision=precision)
+    cm_lib = _tskit.CompressedMatrix(ll_ts)
+    ls_hmm.forward_matrix(h, cm_lib)
+    F3 = cm_lib.decode()
+
+    assert_compressed_matrices_equal(cm, cm_lib)
+
+    nt.assert_allclose(F, F3)
+    nt.assert_allclose(c, cm_lib.normalisation_factor)
+    return cm_lib
+
+
+def check_backward_matrix(ts, h, forward_cm, recombination=None, mutation=None):
+    precision = 22
+    h = np.array(h).astype(np.int8)
+    m = ts.num_sites
+    assert len(h) == m
+    if recombination is None:
+        recombination = np.zeros(ts.num_sites) + 1e-9
+    if mutation is None:
+        mutation = np.zeros(ts.num_sites)
+
+    G = ts.genotype_matrix()
+    B = ls.backwards(
+        G,
+        h.reshape(1, m),
+        forward_cm.normalisation_factor,
+        recombination,
+        p_mutation=mutation,
+        scale_mutation_based_on_n_alleles=False,
+    )
+
+    backward_cm = ls_backward_tree(
+        h,
+        ts,
+        recombination,
+        mutation,
+        forward_cm.normalisation_factor,
+        precision=precision,
+    )
+    nt.assert_array_equal(
+        backward_cm.normalisation_factor, forward_cm.normalisation_factor
+    )
+
+    ll_ts = ts._ll_tree_sequence
+    ls_hmm = _tskit.LsHmm(ll_ts, recombination, mutation, precision=precision)
+    cm_lib = _tskit.CompressedMatrix(ll_ts)
+    ls_hmm.backward_matrix(h, forward_cm.normalisation_factor, cm_lib)
+
+    assert_compressed_matrices_equal(backward_cm, cm_lib)
+
+    B_lib = cm_lib.decode()
+    B_tree = backward_cm.decode()
+    nt.assert_allclose(B_tree, B_lib)
+    nt.assert_allclose(B, B_lib)
+
+
+def add_unique_sample_mutations(ts, start=0):
     """
-    Base for forward algorithm tests.
+    Adds a mutation for each of the samples at equally spaced locations
+    along the genome.
     """
+    tables = ts.dump_tables()
+    L = int(ts.sequence_length)
+    assert L % ts.num_samples == 0
+    gap = L // ts.num_samples
+    x = start
+    for u in ts.samples():
+        site = tables.sites.add_row(position=x, ancestral_state="0")
+        tables.mutations.add_row(site=site, derived_state="1", node=u)
+        x += gap
+    return tables.tree_sequence()
 
 
-class TestNumpyMatrixMethod(ForwardAlgorithmBase):
-    """
-    Tests that we compute the same values from the numpy matrix method as
-    the naive algorithm.
-    """
+class TestSingleBalancedTreeExample:
+    # 3.00┊    6    ┊
+    #     ┊  ┏━┻━┓  ┊
+    # 2.00┊  4   5  ┊
+    #     ┊ ┏┻┓ ┏┻┓ ┊
+    # 1.00┊ 0 1 2 3 ┊
+    #     0         8
 
-    def verify(self, ts, alleles=tskit.ALLELES_01):
-        G = ts.genotype_matrix(alleles=alleles)
-        for h, rho, mu in self.example_parameters(ts, alleles):
-            F1, S1 = ls_forward_matrix(h, alleles, G, rho, mu)
-            F2, S2 = ls_forward_matrix_naive(h, alleles, G, rho, mu)
-            self.assertAllClose(F1, F2)
-            self.assertAllClose(S1, S2)
-
-
-class ViterbiAlgorithmBase(LiStephensBase):
-    """
-    Base for viterbi algoritm tests.
-    """
-
-
-class TestExactMatchViterbi(ViterbiAlgorithmBase):
-    def verify(self, ts, alleles=tskit.ALLELES_01):
-        G = ts.genotype_matrix(alleles=alleles)
-        H = G.T
-        # print(H)
-        rho = np.zeros(ts.num_sites) + 0.1
-        mu = np.zeros(ts.num_sites)
-        rho[0] = 0
-        for h in H:
-            p1 = ls_viterbi_naive(h, alleles, G, rho, mu)
-            p2 = ls_viterbi_vectorised(h, alleles, G, rho, mu)
-            cm1 = ls_viterbi_tree(h, alleles, ts, rho, mu, use_lib=True)
-            p3 = cm1.traceback()
-            cm2 = ls_viterbi_tree(h, alleles, ts, rho, mu, use_lib=False)
-            p4 = cm1.traceback()
-            self.assertCompressedMatricesEqual(cm1, cm2)
-
-            assert len(np.unique(p1)) == 1
-            assert len(np.unique(p2)) == 1
-            assert len(np.unique(p3)) == 1
-            assert len(np.unique(p4)) == 1
-            m1 = H[p1, np.arange(H.shape[1])]
-            assert np.array_equal(m1, h)
-            m2 = H[p2, np.arange(H.shape[1])]
-            assert np.array_equal(m2, h)
-            m3 = H[p3, np.arange(H.shape[1])]
-            assert np.array_equal(m3, h)
-            m4 = H[p3, np.arange(H.shape[1])]
-            assert np.array_equal(m4, h)
-
-
-@pytest.mark.slow
-class TestGeneralViterbi(ViterbiAlgorithmBase, unittest.TestCase):
-    def verify(self, ts, alleles=tskit.ALLELES_01):
-        # np.set_printoptions(linewidth=20000)
-        # np.set_printoptions(threshold=20000000)
-        G = ts.genotype_matrix(alleles=alleles)
-        # m, n = G.shape
-        for h, rho, mu in self.example_parameters(ts, alleles):
-            # print("h = ", h)
-            # print("rho=", rho)
-            # print("mu = ", mu)
-            p1 = ls_viterbi_vectorised(h, alleles, G, rho, mu)
-            p2 = ls_viterbi_naive(h, alleles, G, rho, mu)
-            cm1 = ls_viterbi_tree(h, alleles, ts, rho, mu, use_lib=True)
-            p3 = cm1.traceback()
-            cm2 = ls_viterbi_tree(h, alleles, ts, rho, mu, use_lib=False)
-            p4 = cm1.traceback()
-            self.assertCompressedMatricesEqual(cm1, cm2)
-            # print()
-            # m1 = H[p1, np.arange(m)]
-            # m2 = H[p2, np.arange(m)]
-            # m3 = H[p3, np.arange(m)]
-            # count = np.unique(p1).shape[0]
-            # print()
-            # print("\tp1 = ", p1)
-            # print("\tp2 = ", p2)
-            # print("\tp3 = ", p3)
-            # print("\tm1 = ", m1)
-            # print("\tm2 = ", m2)
-            # print("\t h = ", h)
-            proba1 = ls_path_log_probability(h, p1, alleles, G, rho, mu)
-            proba2 = ls_path_log_probability(h, p2, alleles, G, rho, mu)
-            proba3 = ls_path_log_probability(h, p3, alleles, G, rho, mu)
-            proba4 = ls_path_log_probability(h, p4, alleles, G, rho, mu)
-            # print("\t P = ", proba1, proba2)
-            self.assertAlmostEqual(proba1, proba2, places=6)
-            self.assertAlmostEqual(proba1, proba3, places=6)
-            self.assertAlmostEqual(proba1, proba4, places=6)
-
-
-class TestMissingHaplotypes(LiStephensBase):
-    def verify(self, ts, alleles=tskit.ALLELES_01):
-        G = ts.genotype_matrix(alleles=alleles)
-        H = G.T
-
-        rho = np.zeros(ts.num_sites) + 0.1
-        rho[0] = 0
-        mu = np.zeros(ts.num_sites) + 0.001
-
-        # When everything is missing data we should have no recombinations.
-        h = H[0].copy()
-        h[:] = tskit.MISSING_DATA
-        path = ls_viterbi_vectorised(h, alleles, G, rho, mu)
-        assert np.all(path == 0)
-        cm = ls_viterbi_tree(h, alleles, ts, rho, mu, use_lib=True)
-        # For the tree base algorithm it's not simple which particular sample
-        # gets chosen.
-        path = cm.traceback()
-        assert len(set(path)) == 1
-
-        # TODO Not clear what else we can check about missing data.
-
-
-class TestForwardMatrixScaling(ForwardAlgorithmBase, unittest.TestCase):
-    """
-    Tests that we get the correct values from scaling version of the matrix
-    algorithm works correctly.
-    """
-
-    def verify(self, ts, alleles=tskit.ALLELES_01):
-        G = ts.genotype_matrix(alleles=alleles)
-        computed_log_proba = False
-        for h, rho, mu in self.example_parameters(ts, alleles):
-            F_unscaled = ls_forward_matrix_unscaled(h, alleles, G, rho, mu)
-            F, S = ls_forward_matrix(h, alleles, G, rho, mu)
-            column = np.atleast_2d(np.cumprod(S)).T
-            F_scaled = F * column
-            self.assertAllClose(F_scaled, F_unscaled)
-            log_proba1 = forward_matrix_log_proba(F, S)
-            psum = np.sum(F_unscaled[-1])
-            # If the computed probability is close to zero, there's no point in
-            # computing.
-            if psum > 1e-20:
-                computed_log_proba = True
-                log_proba2 = np.log(psum)
-                self.assertAlmostEqual(log_proba1, log_proba2)
-        assert computed_log_proba
-
-
-class TestForwardTree(ForwardAlgorithmBase):
-    """
-    Tests that the tree algorithm computes the same forward matrix as the
-    simple method.
-    """
-
-    def verify(self, ts, alleles=tskit.ALLELES_01):
-        G = ts.genotype_matrix(alleles=alleles)
-        for h, rho, mu in self.example_parameters(ts, alleles):
-            F, S = ls_forward_matrix(h, alleles, G, rho, mu)
-            cm1 = ls_forward_tree(h, alleles, ts, rho, mu, use_lib=True)
-            cm2 = ls_forward_tree(h, alleles, ts, rho, mu, use_lib=False)
-            self.assertCompressedMatricesEqual(cm1, cm2)
-            Ft = cm1.decode()
-            self.assertAllClose(S, cm1.normalisation_factor)
-            self.assertAllClose(F, Ft)
-
-
-class TestAllPaths(unittest.TestCase):
-    """
-    Tests that we compute the correct forward probablities if we sum over all
-    possible paths through the genotype matrix.
-    """
-
-    def verify(self, G, h):
-        m, n = G.shape
-        rho = np.zeros(m) + 0.1
-        mu = np.zeros(m) + 0.01
-        rho[0] = 0
-        proba = 0
-        for path in itertools.product(range(n), repeat=m):
-            proba += ls_path_probability(h, path, G, rho, mu)
-
-        alleles = [["0", "1"] for _ in range(m)]
-        F = ls_forward_matrix_unscaled(h, alleles, G, rho, mu)
-        forward_proba = np.sum(F[-1])
-        self.assertAlmostEqual(proba, forward_proba)
-
-    def test_n3_m4(self):
-        G = np.array(
-            [
-                # fmt: off
-                [1, 0, 0],
-                [0, 0, 1],
-                [1, 0, 1],
-                [0, 1, 1],
-                # fmt: on
-            ]
+    @staticmethod
+    def ts():
+        return add_unique_sample_mutations(
+            tskit.Tree.generate_balanced(4, span=8).tree_sequence,
+            start=1,
         )
-        self.verify(G, [0, 0, 0, 0])
-        self.verify(G, [1, 1, 1, 1])
-        self.verify(G, [1, 1, 0, 0])
 
-    def test_n4_m5(self):
-        G = np.array(
-            [
-                # fmt: off
-                [1, 0, 0, 0],
-                [0, 0, 1, 1],
-                [1, 0, 1, 1],
-                [0, 1, 1, 0],
-                # fmt: on
-            ]
+    @pytest.mark.parametrize("j", [0, 1, 2, 3])
+    def test_match_sample(self, j):
+        ts = self.ts()
+        h = np.zeros(4)
+        h[j] = 1
+        path = check_viterbi(ts, h)
+        nt.assert_array_equal([j, j, j, j], path)
+        cm = check_forward_matrix(ts, h)
+        check_backward_matrix(ts, h, cm)
+
+    @pytest.mark.parametrize("j", [1, 2])
+    def test_match_sample_missing_flanks(self, j):
+        ts = self.ts()
+        h = np.zeros(4)
+        h[0] = -1
+        h[-1] = -1
+        h[j] = 1
+        path = check_viterbi(ts, h)
+        nt.assert_array_equal([j, j, j, j], path)
+        cm = check_forward_matrix(ts, h)
+        check_backward_matrix(ts, h, cm)
+
+    def test_switch_each_sample(self):
+        ts = self.ts()
+        h = np.ones(4)
+        path = check_viterbi(ts, h)
+        nt.assert_array_equal([0, 1, 2, 3], path)
+        cm = check_forward_matrix(ts, h)
+        check_backward_matrix(ts, h, cm)
+
+    def test_switch_each_sample_missing_flanks(self):
+        ts = self.ts()
+        h = np.ones(4)
+        h[0] = -1
+        h[-1] = -1
+        path = check_viterbi(ts, h)
+        nt.assert_array_equal([1, 1, 2, 2], path)
+        cm = check_forward_matrix(ts, h)
+        check_backward_matrix(ts, h, cm)
+
+    def test_switch_each_sample_missing_middle(self):
+        ts = self.ts()
+        h = np.ones(4)
+        h[1:3] = -1
+        path = check_viterbi(ts, h)
+        # Implementation of Viterbi switches at right-most position
+        nt.assert_array_equal([0, 3, 3, 3], path)
+        cm = check_forward_matrix(ts, h)
+        check_backward_matrix(ts, h, cm)
+
+
+class TestSimulationExamples:
+    @pytest.mark.parametrize("n", [3, 10, 50])
+    @pytest.mark.parametrize("L", [1, 10, 100])
+    def test_continuous_genome(self, n, L):
+        ts = msprime.simulate(
+            n, length=L, recombination_rate=1, mutation_rate=1, random_seed=42
         )
-        self.verify(G, [0, 0, 0, 0, 0])
-        self.verify(G, [1, 1, 1, 1, 1])
-        self.verify(G, [1, 1, 0, 0, 0])
-
-    def test_n5_m5(self):
-        G = np.zeros((5, 5), dtype=int)
-        np.fill_diagonal(G, 1)
-        self.verify(G, [0, 0, 0, 0, 0])
-        self.verify(G, [1, 1, 1, 1, 1])
-        self.verify(G, [1, 1, 0, 0, 0])
-
-
-class TestBasicViterbi:
-    """
-    Very simple tests of the Viterbi algorithm.
-    """
-
-    def verify_exact_match(self, G, h, path):
-        m, n = G.shape
-        rho = np.zeros(m) + 1e-9
-        mu = np.zeros(m)  # Set mu to zero exact match
-        rho[0] = 0
-        alleles = [["0", "1"] for _ in range(m)]
-        path1 = ls_viterbi_naive(h, alleles, G, rho, mu)
-        path2 = ls_viterbi_vectorised(h, alleles, G, rho, mu)
-        assert list(path1) == path
-        assert list(path2) == path
-
-    def test_n2_m6_exact(self):
-        G = np.array(
-            [
-                # fmt: off
-                [1, 0],
-                [1, 0],
-                [1, 0],
-                [0, 1],
-                [0, 1],
-                [0, 1],
-                # fmt: on
-            ]
-        )
-        self.verify_exact_match(G, [1, 1, 1, 1, 1, 1], [0, 0, 0, 1, 1, 1])
-        self.verify_exact_match(G, [0, 0, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0])
-        self.verify_exact_match(G, [0, 0, 0, 1, 1, 1], [1, 1, 1, 1, 1, 1])
-        self.verify_exact_match(G, [0, 0, 0, 1, 1, 0], [1, 1, 1, 1, 1, 0])
-        self.verify_exact_match(G, [0, 0, 0, 0, 1, 0], [1, 1, 1, 0, 1, 0])
-
-    def test_n3_m6_exact(self):
-        G = np.array(
-            [
-                # fmt: off
-                [1, 0, 1],
-                [1, 0, 0],
-                [1, 0, 1],
-                [0, 1, 0],
-                [0, 1, 1],
-                [0, 1, 0],
-                # fmt: on
-            ]
-        )
-        self.verify_exact_match(G, [1, 1, 1, 1, 1, 1], [0, 0, 0, 1, 1, 1])
-        self.verify_exact_match(G, [0, 0, 0, 0, 0, 0], [1, 1, 1, 0, 0, 0])
-        self.verify_exact_match(G, [0, 0, 0, 1, 1, 1], [1, 1, 1, 1, 1, 1])
-        self.verify_exact_match(G, [1, 0, 1, 0, 1, 0], [2, 2, 2, 2, 2, 2])
-
-    def test_n3_m6(self):
-        G = np.array(
-            [
-                # fmt: off
-                [1, 0, 1],
-                [1, 0, 0],
-                [1, 0, 1],
-                [0, 1, 0],
-                [0, 1, 1],
-                [0, 1, 0],
-                # fmt: on
-            ]
-        )
-
-        m, n = G.shape
-        rho = np.zeros(m) + 1e-2
-        mu = np.zeros(m)
-        rho[0] = 0
-        alleles = [["0", "1"] for _ in range(m)]
-        h = np.ones(m, dtype=int)
-        path1 = ls_viterbi_naive(h, alleles, G, rho, mu)
-
-        # Add in mutation at a very low rate.
-        mu[:] = 1e-8
-        path2 = ls_viterbi_naive(h, alleles, G, rho, mu)
-        path3 = ls_viterbi_vectorised(h, alleles, G, rho, mu)
-        assert np.array_equal(path1, path2)
-        assert np.array_equal(path2, path3)
+        h = np.zeros(ts.num_sites, dtype=np.int8)
+        # NOTE this is a bit slow at the moment but we can disable the Python
+        # implementation once testing has been improved on smaller examples.
+        # Add ``compare_py=False``to these calls.
+        check_viterbi(ts, h)
+        cm = check_forward_matrix(ts, h)
+        check_backward_matrix(ts, h, cm)

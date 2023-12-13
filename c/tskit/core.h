@@ -152,7 +152,7 @@ to the API or ABI are introduced, i.e., the addition of a new function.
 The library patch version. Incremented when any changes not relevant to the
 to the API or ABI are introduced, i.e., internal refactors of bugfixes.
 */
-#define TSK_VERSION_PATCH   1
+#define TSK_VERSION_PATCH   2
 /** @} */
 
 /*
@@ -500,6 +500,11 @@ the edge on which it occurs, and wasn't TSK_UNKNOWN_TIME.
 A single site had a mixture of known mutation times and TSK_UNKNOWN_TIME
 */
 #define TSK_ERR_MUTATION_TIME_HAS_BOTH_KNOWN_AND_UNKNOWN            -509
+/**
+Some mutations have TSK_UNKNOWN_TIME in an algorithm where that's
+disallowed (use compute_mutation_times?).
+*/
+#define TSK_ERR_DISALLOWED_UNKNOWN_MUTATION_TIME                    -510
 /** @} */
 
 /**
@@ -675,6 +680,20 @@ Statistics based on branch lengths were attempted when the ``time_units``
 were ``uncalibrated``.
 */
 #define TSK_ERR_TIME_UNCALIBRATED                                   -910
+/**
+The TSK_STAT_POLARISED option was passed to a statistic that does
+not support it.
+*/
+#define TSK_ERR_STAT_POLARISED_UNSUPPORTED                          -911
+/**
+The TSK_STAT_SPAN_NORMALISE option was passed to a statistic that does
+not support it.
+*/
+#define TSK_ERR_STAT_SPAN_NORMALISE_UNSUPPORTED                     -912
+/**
+Insufficient weights were provided.
+*/
+#define TSK_ERR_INSUFFICIENT_WEIGHTS                                -913
 /** @} */
 
 /**
@@ -851,6 +870,16 @@ An individual had nodes from more than one time
 */
 #define TSK_ERR_INDIVIDUAL_TIME_MISMATCH                           -1704
 /** @} */
+
+/**
+@defgroup EXTEND_EDGES_ERROR_GROUP Extend edges errors.
+@{
+*/
+/**
+Maximum iteration number (max_iter) must be positive.
+*/
+#define TSK_ERR_EXTEND_EDGES_BAD_MAXITER                          -1800
+/** @} */
 // clang-format on
 
 /* This bit is 0 for any errors originating from kastore */
@@ -994,6 +1023,30 @@ int tsk_memcmp(const void *s1, const void *s2, tsk_size_t size);
 /* Developer debug utilities. These are **not** threadsafe */
 void tsk_set_debug_stream(FILE *f);
 FILE *tsk_get_debug_stream(void);
+
+/* Bit Array functionality */
+
+typedef uint32_t tsk_bit_array_value_t;
+typedef struct {
+    tsk_size_t size;             // Number of chunks per row
+    tsk_bit_array_value_t *data; // Array data
+} tsk_bit_array_t;
+
+#define TSK_BIT_ARRAY_CHUNK 5U
+#define TSK_BIT_ARRAY_NUM_BITS (1U << TSK_BIT_ARRAY_CHUNK)
+
+int tsk_bit_array_init(tsk_bit_array_t *self, tsk_size_t num_bits, tsk_size_t length);
+void tsk_bit_array_free(tsk_bit_array_t *self);
+void tsk_bit_array_get_row(
+    const tsk_bit_array_t *self, tsk_size_t row, tsk_bit_array_t *out);
+void tsk_bit_array_intersect(
+    const tsk_bit_array_t *self, const tsk_bit_array_t *other, tsk_bit_array_t *out);
+void tsk_bit_array_subtract(tsk_bit_array_t *self, const tsk_bit_array_t *other);
+void tsk_bit_array_add(tsk_bit_array_t *self, const tsk_bit_array_t *other);
+void tsk_bit_array_add_bit(tsk_bit_array_t *self, const tsk_bit_array_value_t bit);
+bool tsk_bit_array_contains(
+    const tsk_bit_array_t *self, const tsk_bit_array_value_t bit);
+tsk_size_t tsk_bit_array_count(const tsk_bit_array_t *self);
 
 #ifdef __cplusplus
 }

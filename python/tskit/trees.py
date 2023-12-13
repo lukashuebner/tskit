@@ -661,6 +661,7 @@ class Tree:
                 "The sample_counts option is not supported since 0.2.4 "
                 "and is ignored",
                 RuntimeWarning,
+                stacklevel=4,
             )
         if sample_lists:
             options |= _tskit.SAMPLE_LISTS
@@ -820,7 +821,6 @@ class Tree:
 
         .. include:: substitutions/linear_traversal_warning.rst
 
-
         :param int index: The tree index to seek to.
         :raises IndexError: If an index outside the acceptable range is provided.
         """
@@ -829,12 +829,7 @@ class Tree:
             index += num_trees
         if index < 0 or index >= num_trees:
             raise IndexError("Index out of bounds")
-        # This should be implemented in C efficiently using the indexes.
-        # No point in complicating the current implementation by trying
-        # to seek from the correct direction.
-        self.first()
-        while self.index != index:
-            self.next()
+        self._ll_tree.seek_index(index)
 
     def seek(self, position):
         """
@@ -884,7 +879,7 @@ class Tree:
             from which the tree is taken will have its
             :attr:`~tskit.TreeSequence.sequence_length` equal to ``span``.
         :param: float branch_length: The minimum length of a branch in this tree.
-        :raises: ValueError: If the given rank is out of bounds for trees
+        :raises ValueError: If the given rank is out of bounds for trees
             with ``num_leaves`` leaves.
         """
         rank_tree = combinatorics.RankTree.unrank(num_leaves, rank)
@@ -1002,8 +997,10 @@ class Tree:
         """
         Returns the most recent common ancestor of the specified nodes.
 
-        :param int `*args`: input node IDs, must be at least 2.
-        :return: The most recent common ancestor of input nodes.
+        :param int `*args`: input node IDs, at least 2 arguments are required.
+        :return: The node ID of the most recent common ancestor of the
+            input nodes, or :data:`tskit.NULL` if the nodes do not share
+            a common ancestor in the tree.
         :rtype: int
         """
         if len(args) < 2:
@@ -1019,12 +1016,12 @@ class Tree:
         # Deprecated alias for tmrca
         return self.tmrca(u, v)
 
-    def tmrca(self, u, v):
+    def tmrca(self, *args):
         """
         Returns the time of the most recent common ancestor of the specified
         nodes. This is equivalent to::
 
-            >>> tree.time(tree.mrca(u, v))
+            >>> tree.time(tree.mrca(*args))
 
         .. note::
             If you are using this method to calculate average tmrca values along the
@@ -1035,12 +1032,16 @@ class Tree:
             nodes, for samples at time 0 the resulting statistics will be exactly
             twice the tmrca value.
 
-        :param int u: The first node.
-        :param int v: The second node.
-        :return: The time of the most recent common ancestor of u and v.
+        :param `*args`: input node IDs, at least 2 arguments are required.
+        :return: The time of the most recent common ancestor of all the nodes.
         :rtype: float
+        :raises ValueError: If the nodes do not share a single common ancestor in this
+            tree (i.e., if ``tree.mrca(*args) == tskit.NULL``)
         """
-        return self.get_time(self.get_mrca(u, v))
+        mrca = self.mrca(*args)
+        if mrca == tskit.NULL:
+            raise ValueError(f"Nodes {args} do not share a common ancestor in the tree")
+        return self.get_time(mrca)
 
     def get_parent(self, u):
         # Deprecated alias for parent
@@ -1513,6 +1514,7 @@ class Tree:
             "in the topology of the current tree (i.e. reachable from the roots) "
             "use len(tree.preorder()).",
             FutureWarning,
+            stacklevel=4,
         )
         return self.tree_sequence.num_nodes
 
@@ -1604,7 +1606,7 @@ class Tree:
 
         :return: The root node.
         :rtype: int
-        :raises: :class:`ValueError` if this tree contains more than one root.
+        :raises ValueError: if this tree contains more than one root.
         """
         if self.has_multiple_roots:
             raise ValueError("More than one root exists. Use tree.roots instead")
@@ -2187,9 +2189,12 @@ class Tree:
     def samples(self, u=None):
         """
         Returns an iterator over the numerical IDs of all the sample nodes in
-        this tree that are underneath node ``u``. If ``u`` is a sample, it is
-        included in the returned iterator. If u is not specified, return all
-        sample node IDs in the tree.
+        this tree that are underneath the node with ID ``u``. If ``u`` is a sample,
+        it is included in the returned iterator. If ``u`` is not a sample, it is
+        possible for the returned iterator to be empty, for example if ``u`` is an
+        :meth:`isolated<Tree.is_isolated>` node that is not part of the the current
+        topology. If u is not specified, return all sample node IDs in the tree
+        (equivalent to all the sample node IDs in the tree sequence).
 
         If the :meth:`TreeSequence.trees` method is called with
         ``sample_lists=True``, this method uses an efficient algorithm to find
@@ -4118,6 +4123,7 @@ class TreeSequence:
             warnings.warn(
                 "The zlib_compression option is no longer supported and is ignored",
                 RuntimeWarning,
+                stacklevel=4,
             )
         file, local_file = util.convert_file_like_to_open_file(file_or_path, "wb")
         try:
@@ -4564,14 +4570,14 @@ class TreeSequence:
             raise ValueError(
                 "max_root_time is not defined in a tree sequence with 0 samples"
             )
-        ret = max(self.node(u).time for u in self.samples())
+        ret = max(self.nodes_time[u] for u in self.samples())
         if self.num_edges > 0:
             # Edges are guaranteed to be listed in parent-time order, so we can get the
             # last one to get the oldest root
             edge = self.edge(self.num_edges - 1)
             # However, we can have situations where there is a sample older than a
             # 'proper' root
-            ret = max(ret, self.node(edge.parent).time)
+            ret = max(ret, self.nodes_time[edge.parent])
         return ret
 
     def migrations(self):
@@ -5212,10 +5218,10 @@ class TreeSequence:
             *Deprecated in 0.3.0. Use ``isolated_as_missing``, but inverting value.
             Will be removed in a future version*
         :rtype: collections.abc.Iterable
-        :raises: TypeError if the ``missing_data_character`` or any of the alleles
+        :raises TypeError: if the ``missing_data_character`` or any of the alleles
             at a site are not a single ascii character.
-        :raises: ValueError
-            if the ``missing_data_character`` exists in one of the alleles
+        :raises ValueError: if the ``missing_data_character`` exists in one of the
+            alleles
         """
         if impute_missing_data is not None:
             warnings.warn(
@@ -5223,6 +5229,7 @@ class TreeSequence:
                 " be removed. Use ``isolated_as_missing=False`` instead of"
                 "``impute_missing_data=True``.",
                 FutureWarning,
+                stacklevel=4,
             )
         # Only use impute_missing_data if isolated_as_missing has the default value
         if isolated_as_missing is None:
@@ -5322,6 +5329,7 @@ class TreeSequence:
                 " be removed. Use ``isolated_as_missing=False`` instead of"
                 "``impute_missing_data=True``.",
                 FutureWarning,
+                stacklevel=4,
             )
         # Only use impute_missing_data if isolated_as_missing has the default value
         if isolated_as_missing is None:
@@ -5407,6 +5415,7 @@ class TreeSequence:
                 " be removed. Use ``isolated_as_missing=False`` instead of"
                 "``impute_missing_data=True``.",
                 FutureWarning,
+                stacklevel=4,
             )
         # Only use impute_missing_data if isolated_as_missing has the default value
         if isolated_as_missing is None:
@@ -5522,10 +5531,9 @@ class TreeSequence:
         :return: An iterator over the alignment strings for specified samples in
             this tree sequence, in the order given in ``samples``.
         :rtype: collections.abc.Iterable
-        :raises: ValueError
-            if any genome coordinate in this tree sequence is not discrete,
-            or if the ``reference_sequence`` is not of the correct length.
-        :raises: TypeError if any of the alleles at a site are not a
+        :raises ValueError: if any genome coordinate in this tree sequence is not
+            discrete, or if the ``reference_sequence`` is not of the correct length.
+        :raises TypeError: if any of the alleles at a site are not a
             single ascii character.
         """
         if not self.discrete_genome:
@@ -5658,7 +5666,7 @@ class TreeSequence:
     @property
     def individuals_flags(self):
         """
-        Efficient access to the ``flags`` column in the
+        Efficient access to the bitwise ``flags`` column in the
         :ref:`sec_individual_table_definition` as a numpy array (dtype=np.uint32).
         Equivalent to ``ts.tables.individuals.flags`` (but avoiding the full copy
         of the table data that accessing ``ts.tables`` currently entails).
@@ -5678,7 +5686,7 @@ class TreeSequence:
     @property
     def nodes_flags(self):
         """
-        Efficient access to the ``flags`` column in the
+        Efficient access to the bitwise ``flags`` column in the
         :ref:`sec_node_table_definition` as a numpy array (dtype=np.uint32).
         Equivalent to ``ts.tables.nodes.flags`` (but avoiding the full copy
         of the table data that accessing ``ts.tables`` currently entails).
@@ -6904,6 +6912,56 @@ class TreeSequence:
         tables.delete_older(time)
         return tables.tree_sequence()
 
+    def extend_edges(self, max_iter=10):
+        """
+        Returns a new tree sequence in which the span covered by ancestral nodes
+        is "extended" to regions of the genome according to the following rule:
+        If an ancestral segment corresponding to node `n` has parent `p` and
+        child `c` on some portion of the genome, and on an adjacent segment of
+        genome `p` is the immediate parent of `c`, then `n` is inserted into the
+        edge from `p` to `c`. This involves extending the span of the edges
+        from `p` to `n` and `n` to `c` and reducing the span of the edge from
+        `p` to `c`. However, any edges whose child node is a sample will not
+        be modified.
+
+        Since some edges may be removed entirely, this process reduces (or at
+        least does not increase) the number of edges in the tree sequence.
+
+        *Note:* this is a somewhat experimental operation, and is probably not
+        what you are looking for.
+
+        The method works by iterating over the genome to look for edges that can
+        be extended in this way; the maximum number of such iterations is
+        controlled by ``max_iter``.
+
+        The rationale is that we know that `n` carries a portion of the segment
+        of ancestral genome inherited by `c` from `p`, and so likely carries
+        the *entire* inherited segment (since the implication otherwise would
+        be that distinct recombined segments were passed down separately from
+        `p` to `c`).
+
+        If an edge that a mutation falls on is split by this operation, the
+        mutation's node may need to be moved. This is only unambiguous if the
+        mutation's time is known, so the method requires known mutation times.
+        See :meth:`.impute_unknown_mutations_time` if mutation times are
+        not known.
+
+        The method will not affect the marginal trees (so, if the original tree
+        sequence was simplified, then following up with `simplify` will recover
+        the original tree sequence, possibly with edges in a different order).
+        It will also not affect the genotype matrix, or any of the tables other
+        than the edge table or the node column in the mutation table.
+
+        :param int max_iters: The maximum number of iterations over the tree
+            sequence. Defaults to 10.
+
+        :return: A new tree sequence with unary nodes extended.
+        :rtype: tskit.TreeSequence
+        """
+        max_iter = int(max_iter)
+        ll_ts = self._ll_tree_sequence.extend_edges(max_iter)
+        return TreeSequence(ll_ts)
+
     def subset(
         self,
         nodes,
@@ -7561,6 +7619,48 @@ class TreeSequence:
                 stat = stat[()]
         return stat
 
+    def __k_way_weighted_stat(
+        self,
+        ll_method,
+        k,
+        W,
+        indexes=None,
+        windows=None,
+        mode=None,
+        span_normalise=True,
+        polarised=False,
+    ):
+        W = np.asarray(W)
+        if indexes is None:
+            if W.shape[1] != k:
+                raise ValueError(
+                    "Must specify indexes if there are not exactly {} columns "
+                    "in W.".format(k)
+                )
+            indexes = np.arange(k, dtype=np.int32)
+        drop_dimension = False
+        indexes = util.safe_np_int_cast(indexes, np.int32)
+        if len(indexes.shape) == 1:
+            indexes = indexes.reshape((1, indexes.shape[0]))
+            drop_dimension = True
+        if len(indexes.shape) != 2 or indexes.shape[1] != k:
+            raise ValueError(
+                "Indexes must be convertable to a 2D numpy array with {} "
+                "columns".format(k)
+            )
+        stat = self.__run_windowed_stat(
+            windows,
+            ll_method,
+            W,
+            indexes,
+            mode=mode,
+            span_normalise=span_normalise,
+            polarised=polarised,
+        )
+        if drop_dimension:
+            stat = stat.reshape(stat.shape[:-1])
+        return stat
+
     ############################################
     # Statistics definitions
     ############################################
@@ -7698,8 +7798,84 @@ class TreeSequence:
             span_normalise=span_normalise,
         )
 
-    # JK: commenting this out for now to get the other methods well tested.
-    # Issue: https://github.com/tskit-dev/tskit/issues/201
+    ############################################
+    # Pairwise sample x sample statistics
+    ############################################
+
+    def _chunk_sequence_by_tree(self, num_chunks):
+        """
+        Return list of (left, right) genome interval tuples that contain
+        approximately equal numbers of trees as a 2D numpy array. A
+        maximum of self.num_trees single-tree intervals can be returned.
+        """
+        if num_chunks <= 0 or int(num_chunks) != num_chunks:
+            raise ValueError("Number of chunks must be an integer > 0")
+        num_chunks = min(self.num_trees, num_chunks)
+        breakpoints = self.breakpoints(as_array=True)[:-1]
+        splits = np.array_split(breakpoints, num_chunks)
+        chunks = []
+        for j in range(num_chunks - 1):
+            chunks.append((splits[j][0], splits[j + 1][0]))
+        chunks.append((splits[-1][0], self.sequence_length))
+        return chunks
+
+    @staticmethod
+    def _chunk_windows(windows, num_chunks):
+        """
+        Returns a list of (at most) num_chunks windows, which represent splitting
+        up the specified list of windows into roughly equal work.
+
+        Currently this is implemented by just splitting up into roughly equal
+        numbers of windows in each chunk.
+        """
+        if num_chunks <= 0 or int(num_chunks) != num_chunks:
+            raise ValueError("Number of chunks must be an integer > 0")
+        num_chunks = min(len(windows) - 1, num_chunks)
+        splits = np.array_split(windows[:-1], num_chunks)
+        chunks = []
+        for j in range(num_chunks - 1):
+            chunk = np.append(splits[j], splits[j + 1][0])
+            chunks.append(chunk)
+        chunk = np.append(splits[-1], windows[-1])
+        chunks.append(chunk)
+        return chunks
+
+    def _parallelise_divmat_by_tree(self, num_threads, span_normalise, **kwargs):
+        """
+        No windows were specified, so we can chunk up the whole genome by
+        tree, and do a simple sum of the results. This means that we have to
+        handle span_normalise specially, though.
+        """
+
+        def worker(interval):
+            return self._ll_tree_sequence.divergence_matrix(interval, **kwargs)
+
+        work = self._chunk_sequence_by_tree(num_threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as pool:
+            results = pool.map(worker, work)
+        total = sum(results)
+        if span_normalise:
+            total /= self.sequence_length
+        return total
+
+    def _parallelise_divmat_by_window(self, windows, num_threads, **kwargs):
+        """
+        We assume we have a number of windows that's >= to the number
+        of threads available, and let each thread have a chunk of the
+        windows. There will definitely cases where this leads to
+        pathological behaviour, so we may need a more sophisticated
+        strategy at some point.
+        """
+
+        def worker(sub_windows):
+            return self._ll_tree_sequence.divergence_matrix(sub_windows, **kwargs)
+
+        work = self._chunk_windows(windows, num_threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(worker, sub_windows) for sub_windows in work]
+            concurrent.futures.wait(futures)
+        return np.vstack([future.result() for future in futures])
+
     # def divergence_matrix(self, sample_sets, windows=None, mode="site"):
     #     """
     #     Finds the mean divergence  between pairs of samples from each set of
@@ -7733,6 +7909,57 @@ class TreeSequence:
     #                 A[w, i, j] = A[w, j, i] = x[w][k]
     #                 k += 1
     #     return A
+    # NOTE: see older definition of divmat here, which may be useful when documenting
+    # this function. See https://github.com/tskit-dev/tskit/issues/2781
+
+    # NOTE for documentation of num_threads. Need to explain that the
+    # its best to think of as the number of background *worker* threads.
+    # default is to run without any worker threads. If you want to run
+    # with all the cores on the machine, use num_threads=os.cpu_count().
+
+    def divergence_matrix(
+        self,
+        *,
+        windows=None,
+        samples=None,
+        num_threads=0,
+        mode=None,
+        span_normalise=True,
+    ):
+        windows_specified = windows is not None
+        windows = self.parse_windows(windows)
+        mode = "site" if mode is None else mode
+
+        # FIXME this logic should be merged into __run_windowed_stat if
+        # we generalise the num_threads argument to all stats.
+        if num_threads <= 0:
+            D = self._ll_tree_sequence.divergence_matrix(
+                windows,
+                samples=samples,
+                mode=mode,
+                span_normalise=span_normalise,
+            )
+        else:
+            if windows_specified:
+                D = self._parallelise_divmat_by_window(
+                    windows,
+                    num_threads,
+                    samples=samples,
+                    mode=mode,
+                    span_normalise=span_normalise,
+                )
+            else:
+                D = self._parallelise_divmat_by_tree(
+                    num_threads,
+                    span_normalise=span_normalise,
+                    samples=samples,
+                    mode=mode,
+                )
+
+        if not windows_specified:
+            # Drop the windows dimension
+            D = D[0]
+        return D
 
     def genetic_relatedness(
         self,
@@ -7845,6 +8072,51 @@ class TreeSequence:
             out = numerator / denominator
 
         return out
+
+    def genetic_relatedness_weighted(
+        self,
+        W,
+        indexes=None,
+        windows=None,
+        mode="site",
+        span_normalise=True,
+        polarised=False,
+    ):
+        r"""
+        Computes weighted genetic relatedness. If the k-th pair of indices is (i, j)
+        then the k-th column of output will be
+        :math:`\sum_{a,b} W_{ai} W_{bj} C_{ab}`,
+        where :math:`W` is the matrix of weights, and :math:`C_{ab}` is the
+        :meth:`genetic_relatedness <.TreeSequence.genetic_relatedness>` between sample
+        a and sample b, summing over all pairs of samples in the tree sequence.
+
+        :param numpy.ndarray W: An array of values with one row for each sample node and
+            one column for each set of weights.
+        :param list indexes: A list of 2-tuples, or None (default). Note that if
+            indexes = None, then W must have exactly two columns and this is equivalent
+            to indexes = [(0,1)].
+        :param list windows: An increasing list of breakpoints between the windows
+            to compute the statistic in.
+        :param str mode: A string giving the "type" of the statistic to be computed
+            (defaults to "site").
+        :param bool span_normalise: Whether to divide the result by the span of the
+            window (defaults to True).
+        :return: A ndarray with shape equal to (num windows, num statistics).
+        """
+        if len(W) != self.num_samples:
+            raise ValueError(
+                "First trait dimension must be equal to number of samples."
+            )
+        return self.__k_way_weighted_stat(
+            self._ll_tree_sequence.genetic_relatedness_weighted,
+            2,
+            W,
+            indexes=indexes,
+            windows=windows,
+            mode=mode,
+            span_normalise=span_normalise,
+            polarised=polarised,
+        )
 
     def trait_covariance(self, W, windows=None, mode="site", span_normalise=True):
         """
@@ -7989,6 +8261,7 @@ class TreeSequence:
         warnings.warn(
             "This is deprecated: please use trait_linear_model( ) instead.",
             FutureWarning,
+            stacklevel=4,
         )
         return self.trait_linear_model(*args, **kwargs)
 
@@ -8273,6 +8546,7 @@ class TreeSequence:
         :return: A ndarray with shape equal to (num windows, num statistics).
             If there is one sample set and windows=None, a numpy scalar is returned.
         """
+
         # TODO this should be done in C as we'll want to support this method there.
         def tjd_func(sample_set_sizes, flattened, **kwargs):
             n = sample_set_sizes
@@ -8355,7 +8629,7 @@ class TreeSequence:
                 divergences.shape = (divergences.shape[0], 1, divergences.shape[1])
                 diversities.shape = (diversities.shape[0], 1, diversities.shape[1])
 
-            fst = np.repeat(1.0, np.product(divergences.shape))
+            fst = np.repeat(1.0, np.prod(divergences.shape))
             fst.shape = divergences.shape
             for i, (u, v) in enumerate(indexes):
                 denom = (
@@ -8885,6 +9159,36 @@ class TreeSequence:
             span_normalise=span_normalise,
         )
 
+    def impute_unknown_mutations_time(
+        self,
+        method=None,
+    ):
+        """
+        Returns an array of mutation times, where any unknown times are
+        imputed from the times of associated nodes. Not to be confused with
+        :meth:`TableCollection.compute_mutation_times`, which modifies the
+        ``time`` column of the mutations table in place.
+
+        :param str method: The method used to impute the unknown mutation times.
+            Currently only "min" is supported, which uses the time of the node
+            below the mutation as the mutation time. The "min" method can also
+            be specified by ``method=None`` (Default: ``None``).
+        :return: An array of length equal to the number of mutations in the
+            tree sequence.
+        """
+        allowed_methods = ["min"]
+        if method is None:
+            method = "min"
+        if method not in allowed_methods:
+            raise ValueError(
+                f"Mutations time imputation method must be chosen from {allowed_methods}"
+            )
+        if method == "min":
+            mutations_time = self.mutations_time.copy()
+            unknown = tskit.is_unknown_time(mutations_time)
+            mutations_time[unknown] = self.nodes_time[self.mutations_node[unknown]]
+            return mutations_time
+
     ############################################
     #
     # Deprecated APIs. These are either already unsupported, or will be unsupported in a
@@ -8920,7 +9224,7 @@ class TreeSequence:
         return float(
             self.diversity(
                 [samples], windows=[0, self.sequence_length], span_normalise=False
-            )[0]
+            )[0][0]
         )
 
     def get_time(self, u):

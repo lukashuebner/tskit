@@ -1,6 +1,52 @@
 --------------------
-[0.5.5] - 2023-01-XX
+[0.5.7] - 2023-XX-XX
 --------------------
+
+**Features**
+
+- Add ``TreeSequence.extend_edges`` method that extends ancestral haplotypes
+  using recombination information, leading to unary nodes in many trees and
+  fewer edges. (:user:`petrelharp`, :user:`hfr1tz3`, :user:`avabamf`, :pr:`2651`)
+
+
+--------------------
+[0.5.6] - 2023-10-10
+--------------------
+
+**Breaking Changes**
+
+- tskit now requires Python 3.8, as Python 3.7 became end-of-life on 2023-06-27
+
+**Features**
+
+- Tree.trmca now accepts >2 nodes and returns nicer errors
+  (:user:`hyanwong`, :pr:2808, :issue:`2801`, :issue:`2070`, :issue:`2611`)
+
+- Add ``TreeSequence.genetic_relatedness_weighted`` stats method.
+  (:user:`petrelharp`, :user:`brieuclehmann`, :user:`jeromekelleher`,
+  :pr:`2785`, :pr:`1246`)
+
+- Add ``TreeSequence.impute_unknown_mutations_time`` method to return an
+  array of mutation times based on the times of associated nodes
+  (:user:`duncanMR`, :pr:`2760`, :issue:`2758`)
+
+- Add ``asdict`` to all dataclasses. These are returned when you access a row or
+  other tree sequence object. (:user:`benjeffery`, :pr:`2759`, :issue:`2719`)
+
+**Bugfixes**
+
+- Fix incompatibility with ``jsonschema>4.18.6`` which caused
+  ``AttributeError: module jsonschema has no attribute _validators``
+  (:user:`benjeffery`, :pr:`2844`, :issue:`2840`)
+
+--------------------
+[0.5.5] - 2023-05-17
+--------------------
+
+**Performance improvements**
+
+- Methods like ts.at() which seek to a specified position on the sequence from
+  a new Tree instance are now much faster (:user:`molpopgen`, :pr:`2661`).
 
 **Features**
 
@@ -9,6 +55,11 @@
 
 - Add ``keep_rows`` method to table classes to support efficient in-place
   table subsetting (:user:`jeromekelleher`, :pr:`2700`)
+
+**Bugfixes**
+
+- Fix `UnicodeDecodeError` when calling `Variant.alleles` on the `emscripten` platform.
+  (:user:`benjeffery`, :pr:`2754`, :issue:`2737`)
 
 --------------------
 [0.5.4] - 2023-01-13

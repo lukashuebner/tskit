@@ -209,7 +209,7 @@ int
 tsk_ls_hmm_free(tsk_ls_hmm_t *self)
 {
     tsk_tree_free(&self->tree);
-    tsk_diff_iter_free(&self->diffs);
+    tsk_tree_position_free(&self->tree_pos);
     tsk_safe_free(self->recombination_rate);
     tsk_safe_free(self->mutation_rate);
     tsk_safe_free(self->recombination_rate);
@@ -230,10 +230,9 @@ tsk_ls_hmm_free(tsk_ls_hmm_t *self)
 }
 
 static int
-tsk_ls_hmm_reset(tsk_ls_hmm_t *self)
+tsk_ls_hmm_reset(tsk_ls_hmm_t *self, double value)
 {
     int ret = 0;
-    double n = (double) self->num_samples;
     tsk_size_t j;
     tsk_id_t u;
     const tsk_id_t *samples;
@@ -248,9 +247,8 @@ tsk_ls_hmm_reset(tsk_ls_hmm_t *self)
     tsk_memset(self->transition_parent, 0xff,
         self->max_transitions * sizeof(*self->transition_parent));
 
-    /* This is safe because we've already zero'd out the memory. */
-    tsk_diff_iter_free(&self->diffs);
-    ret = tsk_diff_iter_init_from_ts(&self->diffs, self->tree_sequence, false);
+    tsk_tree_position_free(&self->tree_pos);
+    ret = tsk_tree_position_init(&self->tree_pos, self->tree_sequence, 0);
     if (ret != 0) {
         goto out;
     }
@@ -258,7 +256,7 @@ tsk_ls_hmm_reset(tsk_ls_hmm_t *self)
     for (j = 0; j < self->num_samples; j++) {
         u = samples[j];
         self->transitions[j].tree_node = u;
-        self->transitions[j].value = 1.0 / n;
+        self->transitions[j].value = value;
         self->transition_index[u] = (tsk_id_t) j;
     }
     self->num_transitions = self->num_samples;
@@ -301,26 +299,29 @@ tsk_ls_hmm_remove_dead_roots(tsk_ls_hmm_t *self)
 }
 
 static int
-tsk_ls_hmm_update_tree(tsk_ls_hmm_t *self)
+tsk_ls_hmm_update_tree(tsk_ls_hmm_t *self, int direction)
 {
     int ret = 0;
     tsk_id_t *restrict parent = self->parent;
     tsk_id_t *restrict T_index = self->transition_index;
+    const tsk_id_t *restrict edges_child = self->tree_sequence->tables->edges.child;
+    const tsk_id_t *restrict edges_parent = self->tree_sequence->tables->edges.parent;
     tsk_value_transition_t *restrict T = self->transitions;
-    tsk_edge_list_node_t *record;
-    tsk_edge_list_t records_out, records_in;
-    tsk_edge_t edge;
-    double left, right;
-    tsk_id_t u;
+    tsk_id_t u, c, p, j, e;
     tsk_value_transition_t *vt;
 
-    ret = tsk_diff_iter_next(&self->diffs, &left, &right, &records_out, &records_in);
-    if (ret < 0) {
-        goto out;
+    if (direction == TSK_DIR_FORWARD) {
+        tsk_tree_position_next(&self->tree_pos);
+    } else {
+        tsk_tree_position_prev(&self->tree_pos);
     }
+    tsk_bug_assert(self->tree_pos.index != -1);
+    tsk_bug_assert(self->tree_pos.index == self->tree.index);
 
-    for (record = records_out.head; record != NULL; record = record->next) {
-        u = record->edge.child;
+    for (j = self->tree_pos.out.start; j != self->tree_pos.out.stop; j += direction) {
+        e = self->tree_pos.out.order[j];
+        c = edges_child[e];
+        u = c;
         if (T_index[u] == TSK_NULL) {
             /* Ensure the subtree we're detaching has a transition at the root */
             while (T_index[u] == TSK_NULL) {
@@ -328,25 +329,27 @@ tsk_ls_hmm_update_tree(tsk_ls_hmm_t *self)
                 tsk_bug_assert(u != TSK_NULL);
             }
             tsk_bug_assert(self->num_transitions < self->max_transitions);
-            T_index[record->edge.child] = (tsk_id_t) self->num_transitions;
-            T[self->num_transitions].tree_node = record->edge.child;
+            T_index[c] = (tsk_id_t) self->num_transitions;
+            T[self->num_transitions].tree_node = c;
             T[self->num_transitions].value = T[T_index[u]].value;
             self->num_transitions++;
         }
-        parent[record->edge.child] = TSK_NULL;
+        parent[c] = TSK_NULL;
     }
 
-    for (record = records_in.head; record != NULL; record = record->next) {
-        edge = record->edge;
-        parent[edge.child] = edge.parent;
-        u = edge.parent;
-        if (parent[edge.parent] == TSK_NULL) {
+    for (j = self->tree_pos.in.start; j != self->tree_pos.in.stop; j += direction) {
+        e = self->tree_pos.in.order[j];
+        c = edges_child[e];
+        p = edges_parent[e];
+        parent[c] = p;
+        u = p;
+        if (parent[p] == TSK_NULL) {
             /* Grafting onto a new root. */
-            if (T_index[record->edge.parent] == TSK_NULL) {
-                T_index[edge.parent] = (tsk_id_t) self->num_transitions;
+            if (T_index[p] == TSK_NULL) {
+                T_index[p] = (tsk_id_t) self->num_transitions;
                 tsk_bug_assert(self->num_transitions < self->max_transitions);
-                T[self->num_transitions].tree_node = edge.parent;
-                T[self->num_transitions].value = T[T_index[edge.child]].value;
+                T[self->num_transitions].tree_node = p;
+                T[self->num_transitions].value = T[T_index[c]].value;
                 self->num_transitions++;
             }
         } else {
@@ -356,18 +359,17 @@ tsk_ls_hmm_update_tree(tsk_ls_hmm_t *self)
             }
             tsk_bug_assert(u != TSK_NULL);
         }
-        tsk_bug_assert(T_index[u] != -1 && T_index[edge.child] != -1);
-        if (T[T_index[u]].value == T[T_index[edge.child]].value) {
-            vt = &T[T_index[edge.child]];
+        tsk_bug_assert(T_index[u] != -1 && T_index[c] != -1);
+        if (T[T_index[u]].value == T[T_index[c]].value) {
+            vt = &T[T_index[c]];
             /* Mark the value transition as unusued */
             vt->value = -1;
             vt->tree_node = TSK_NULL;
-            T_index[edge.child] = TSK_NULL;
+            T_index[c] = TSK_NULL;
         }
     }
 
     ret = tsk_ls_hmm_remove_dead_roots(self);
-out:
     return ret;
 }
 
@@ -921,7 +923,7 @@ out:
 }
 
 static int
-tsk_ls_hmm_process_site(
+tsk_ls_hmm_process_site_forward(
     tsk_ls_hmm_t *self, const tsk_site_t *site, int32_t haplotype_state)
 {
     int ret = 0;
@@ -960,28 +962,23 @@ out:
     return ret;
 }
 
-int
-tsk_ls_hmm_run(tsk_ls_hmm_t *self, int32_t *haplotype,
-    int (*next_probability)(tsk_ls_hmm_t *, tsk_id_t, double, bool, tsk_id_t, double *),
-    double (*compute_normalisation_factor)(struct _tsk_ls_hmm_t *), void *output)
+static int
+tsk_ls_hmm_run_forward(tsk_ls_hmm_t *self, int32_t *haplotype)
 {
     int ret = 0;
     int t_ret;
     const tsk_site_t *sites;
     tsk_size_t j, num_sites;
+    const double n = (double) self->num_samples;
 
-    self->next_probability = next_probability;
-    self->compute_normalisation_factor = compute_normalisation_factor;
-    self->output = output;
-
-    ret = tsk_ls_hmm_reset(self);
+    ret = tsk_ls_hmm_reset(self, 1 / n);
     if (ret != 0) {
         goto out;
     }
 
     for (t_ret = tsk_tree_first(&self->tree); t_ret == TSK_TREE_OK;
          t_ret = tsk_tree_next(&self->tree)) {
-        ret = tsk_ls_hmm_update_tree(self);
+        ret = tsk_ls_hmm_update_tree(self, TSK_DIR_FORWARD);
         if (ret != 0) {
             goto out;
         }
@@ -991,7 +988,8 @@ tsk_ls_hmm_run(tsk_ls_hmm_t *self, int32_t *haplotype,
             goto out;
         }
         for (j = 0; j < num_sites; j++) {
-            ret = tsk_ls_hmm_process_site(self, &sites[j], haplotype[sites[j].id]);
+            ret = tsk_ls_hmm_process_site_forward(
+                self, &sites[j], haplotype[sites[j].id]);
             if (ret != 0) {
                 goto out;
             }
@@ -1081,11 +1079,170 @@ tsk_ls_hmm_forward(tsk_ls_hmm_t *self, int32_t *haplotype,
             goto out;
         }
     }
-    ret = tsk_ls_hmm_run(self, haplotype, tsk_ls_hmm_next_probability_forward,
-        tsk_ls_hmm_compute_normalisation_factor_forward, output);
+
+    self->next_probability = tsk_ls_hmm_next_probability_forward;
+    self->compute_normalisation_factor = tsk_ls_hmm_compute_normalisation_factor_forward;
+    self->output = output;
+
+    ret = tsk_ls_hmm_run_forward(self, haplotype);
+out:
+    return ret;
+}
+
+/****************************************************************
+ * Backward Algorithm
+ ****************************************************************/
+
+static int
+tsk_ls_hmm_next_probability_backward(tsk_ls_hmm_t *self, tsk_id_t site_id, double p_last,
+    bool is_match, tsk_id_t TSK_UNUSED(node), double *result)
+{
+    const double mu = self->mutation_rate[site_id];
+    const double num_alleles = self->num_alleles[site_id];
+    double p_e;
+
+    p_e = mu;
+    if (is_match) {
+        p_e = 1 - (num_alleles - 1) * mu;
+    }
+    *result = p_last * p_e;
+    return 0;
+}
+
+static int
+tsk_ls_hmm_process_site_backward(tsk_ls_hmm_t *self, const tsk_site_t *site,
+    const int32_t haplotype_state, const double normalisation_factor)
+{
+    int ret = 0;
+    double x, b_last_sum;
+    tsk_compressed_matrix_t *output = (tsk_compressed_matrix_t *) self->output;
+    tsk_value_transition_t *restrict T = self->transitions;
+    const unsigned int precision = (unsigned int) self->precision;
+    const double rho = self->recombination_rate[site->id];
+    const double n = (double) self->num_samples;
+    tsk_size_t j;
+
+    /* FIXME!!! We are calling compress twice here because we need to compress
+     * immediately before calling store_site in order to filter out -1 nodes,
+     * and also (crucially) to ensure that the value transitions are listed
+     * in preorder, which we rely on later for decoding.
+     *
+     * https://github.com/tskit-dev/tskit/issues/2803
+     */
+    ret = tsk_ls_hmm_compress(self);
     if (ret != 0) {
         goto out;
     }
+    ret = tsk_compressed_matrix_store_site(
+        output, site->id, normalisation_factor, (tsk_size_t) self->num_transitions, T);
+    if (ret != 0) {
+        goto out;
+    }
+
+    ret = tsk_ls_hmm_update_probabilities(self, site, haplotype_state);
+    if (ret != 0) {
+        goto out;
+    }
+    /* DO WE NEED THIS compress?? See above */
+    ret = tsk_ls_hmm_compress(self);
+    if (ret != 0) {
+        goto out;
+    }
+    tsk_bug_assert(self->num_transitions <= self->num_samples);
+    b_last_sum = self->compute_normalisation_factor(self);
+    for (j = 0; j < self->num_transitions; j++) {
+        tsk_bug_assert(T[j].tree_node != TSK_NULL);
+        x = rho * b_last_sum / n + (1 - rho) * T[j].value;
+        x /= normalisation_factor;
+        T[j].value = tsk_round(x, precision);
+    }
+out:
+    return ret;
+}
+
+static int
+tsk_ls_hmm_run_backward(
+    tsk_ls_hmm_t *self, int32_t *haplotype, const double *forward_norm)
+{
+    int ret = 0;
+    int t_ret;
+    const tsk_site_t *sites;
+    double s;
+    tsk_size_t num_sites;
+    tsk_id_t j;
+
+    ret = tsk_ls_hmm_reset(self, 1);
+    if (ret != 0) {
+        goto out;
+    }
+
+    for (t_ret = tsk_tree_last(&self->tree); t_ret == TSK_TREE_OK;
+         t_ret = tsk_tree_prev(&self->tree)) {
+        ret = tsk_ls_hmm_update_tree(self, TSK_DIR_REVERSE);
+        if (ret != 0) {
+            goto out;
+        }
+        /* tsk_ls_hmm_check_state(self); */
+        ret = tsk_tree_get_sites(&self->tree, &sites, &num_sites);
+        if (ret != 0) {
+            goto out;
+        }
+        for (j = (tsk_id_t) num_sites - 1; j >= 0; j--) {
+            s = forward_norm[sites[j].id];
+            if (s <= 0) {
+                /* NOTE: I'm not sure if this is the correct interpretation,
+                 * but norm values of 0 do lead to problems, and this seems
+                 * like a simple way of guarding against it. We do seem to
+                 * get norm values of 0 with impossible matches from the fwd
+                 * matrix.
+                 */
+                ret = TSK_ERR_MATCH_IMPOSSIBLE;
+                goto out;
+            }
+            ret = tsk_ls_hmm_process_site_backward(
+                self, &sites[j], haplotype[sites[j].id], s);
+            if (ret != 0) {
+                goto out;
+            }
+        }
+    }
+    /* Set to zero so we can print and check the state OK. */
+    self->num_transitions = 0;
+    if (t_ret != 0) {
+        ret = t_ret;
+        goto out;
+    }
+out:
+    return ret;
+}
+
+int
+tsk_ls_hmm_backward(tsk_ls_hmm_t *self, int32_t *haplotype, const double *forward_norm,
+    tsk_compressed_matrix_t *output, tsk_flags_t options)
+{
+    int ret = 0;
+
+    if (!(options & TSK_NO_INIT)) {
+        ret = tsk_compressed_matrix_init(output, self->tree_sequence, 0, 0);
+        if (ret != 0) {
+            goto out;
+        }
+    } else {
+        if (output->tree_sequence != self->tree_sequence) {
+            ret = TSK_ERR_BAD_PARAM_VALUE;
+            goto out;
+        }
+        ret = tsk_compressed_matrix_clear(output);
+        if (ret != 0) {
+            goto out;
+        }
+    }
+
+    self->next_probability = tsk_ls_hmm_next_probability_backward;
+    self->compute_normalisation_factor = tsk_ls_hmm_compute_normalisation_factor_forward;
+    self->output = output;
+
+    ret = tsk_ls_hmm_run_backward(self, haplotype, forward_norm);
 out:
     return ret;
 }
@@ -1163,11 +1320,12 @@ tsk_ls_hmm_viterbi(tsk_ls_hmm_t *self, int32_t *haplotype, tsk_viterbi_matrix_t 
             goto out;
         }
     }
-    ret = tsk_ls_hmm_run(self, haplotype, tsk_ls_hmm_next_probability_viterbi,
-        tsk_ls_hmm_compute_normalisation_factor_viterbi, output);
-    if (ret != 0) {
-        goto out;
-    }
+
+    self->next_probability = tsk_ls_hmm_next_probability_viterbi;
+    self->compute_normalisation_factor = tsk_ls_hmm_compute_normalisation_factor_viterbi;
+    self->output = output;
+
+    ret = tsk_ls_hmm_run_forward(self, haplotype);
 out:
     return ret;
 }
@@ -1280,9 +1438,11 @@ tsk_compressed_matrix_store_site(tsk_compressed_matrix_t *self, tsk_id_t site,
     }
 
     for (j = 0; j < num_transitions; j++) {
+        tsk_bug_assert(transitions[j].tree_node >= 0);
         self->values[site][j] = transitions[j].value;
         self->nodes[site][j] = transitions[j].tree_node;
     }
+
 out:
     return ret;
 }
